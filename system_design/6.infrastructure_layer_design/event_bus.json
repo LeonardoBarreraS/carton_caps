@@ -1,0 +1,315 @@
+{
+  "system": "Carton Caps Conversational Assistant",
+  "version": "1.0",
+  "phase": "6 — Infrastructure Layer Design",
+  "task": "Event Bus Generator",
+  "derived_from": [
+    "domain_model.json",
+    "context_communication.json",
+    "adapters.json",
+    "repositories.json",
+    "use_cases.json",
+    "layered_architecture.json",
+    "phase_6_task_analysis.md"
+  ],
+
+  "design_principles": [
+    "Domain events are intra-component signals — they do not drive cross-context communication",
+    "The event publisher port belongs to the application layer — use cases own the decision of when to drain and publish events",
+    "The publisher implementation belongs to the shell layer — it is the only layer permitted to import from multiple bounded contexts",
+    "Events carry immutable data snapshots — the event payload is not modified after emission",
+    "Publishing must never interrupt the main pipeline — a publisher implementation failure must be silently swallowed",
+    "No domain logic lives in publisher implementations — they are pure observability transports",
+    "A single shared implementation instance serves all bounded contexts — one LoggingEventPublisher is wired to all use cases in the composition root",
+    "The drain-and-publish pattern is the only emission mechanism — aggregates accumulate events internally; use cases drain them at the boundary after domain operations complete"
+  ],
+
+  "architectural_decision": {
+    "bus_type": "synchronous_drain_and_publish",
+    "description": "A minimal in-process synchronous publisher. Aggregates raise events into an internal list. Use cases drain that list via collect_events() and pass it to IEventPublisher.publish() immediately after the domain operation returns. The publisher writes each event to a structured file log.",
+    "rationale": [
+      "The RAG pipeline is inherently synchronous — evidence retrieval must complete before response generation. An async event bus would introduce unnecessary complexity with no benefit.",
+      "Domain events in this system are observability signals, not behavioral triggers. GapDetected, for example, surfaces as a DTO field (TurnIntelligenceResultDTO.clarification_needed) — not as a cross-context event. The GapDetected domain event is logged for audit, not routed to a handler.",
+      "Cross-context communication is defined exclusively through direct port calls (COMM-1, COMM-2). Events do not drive any inter-context coordination.",
+      "The prototype scope does not require event replay, durable messaging, or fan-out delivery. These are premature for the current stage.",
+      "No external broker (Kafka, RabbitMQ, Redis Streams) is needed or appropriate. Adding one would be over-engineering."
+    ],
+    "rejected_alternatives": [
+      {
+        "alternative": "Full in-process event bus with subscribe/dispatch pattern",
+        "reason": "No handlers trigger business logic in response to domain events. Subscribe/dispatch machinery adds complexity without a consumer that needs it."
+      },
+      {
+        "alternative": "External message broker (Kafka, RabbitMQ)",
+        "reason": "No async workflow requirements. The system is a synchronous API server with a single-process architecture. A broker would require infrastructure the prototype does not need."
+      },
+      {
+        "alternative": "Shared cross-context event bus",
+        "reason": "Context communication is defined as synchronous direct interface calls. Routing events across contexts would violate the communication model defined in context_communication.json."
+      }
+    ]
+  },
+
+  "event_publisher_ports": [
+    {
+      "id": "EVTBUS-PORT-1",
+      "name": "IEventPublisher",
+      "bounded_context": "BC-1",
+      "bounded_context_name": "conversation_management",
+      "layer": "application",
+      "module_path": "src/conversation_management/application/ports/i_event_publisher.py",
+      "interface": {
+        "method": "publish(events: list) -> None",
+        "contract": "Receives the full list of domain events drained from one aggregate in a single use-case boundary crossing. Must not raise — silently handle all internal failures."
+      },
+      "consumed_events": [
+        {
+          "event_id": "EVT-SS",
+          "event_name": "SessionStarted",
+          "drained_by": "StartSessionUseCase",
+          "aggregate": "ConversationSession"
+        },
+        {
+          "event_id": "EVT-TP",
+          "event_name": "TurnProcessed",
+          "drained_by": "ProcessTurnUseCase",
+          "aggregate": "ConversationSession"
+        },
+        {
+          "event_id": "EVT-SC",
+          "event_name": "SessionClosed",
+          "drained_by": "CloseSessionUseCase",
+          "aggregate": "ConversationSession"
+        }
+      ],
+      "implemented_by": "EVTBUS-IMPL-1"
+    },
+    {
+      "id": "EVTBUS-PORT-2",
+      "name": "IEventPublisher",
+      "bounded_context": "BC-2",
+      "bounded_context_name": "decision_intelligence",
+      "layer": "application",
+      "module_path": "src/decision_intelligence/application/ports/i_event_publisher.py",
+      "interface": {
+        "method": "publish(events: list) -> None",
+        "contract": "Receives the full list of domain events drained from DecisionContext after ProcessTurnIntelligenceUseCase completes the domain operations for the turn."
+      },
+      "consumed_events": [
+        {
+          "event_id": "EVT-CU",
+          "event_name": "ContextUpdated",
+          "drained_by": "ProcessTurnIntelligenceUseCase",
+          "aggregate": "DecisionContext",
+          "note": "Emitted on every turn that adds at least one PreferenceSignal"
+        },
+        {
+          "event_id": "EVT-GD",
+          "event_name": "GapDetected",
+          "drained_by": "ProcessTurnIntelligenceUseCase",
+          "aggregate": "DecisionContext",
+          "note": "Emitted only when gap evaluation finds context insufficient for retrieval intent. The behavioral consequence (clarification_needed=true) is delivered via TurnIntelligenceResultDTO — not via the event."
+        },
+        {
+          "event_id": "EVT-CR",
+          "event_name": "ContextReady",
+          "drained_by": "ProcessTurnIntelligenceUseCase",
+          "aggregate": "DecisionContext",
+          "note": "Emitted when DecisionContext transitions to ready state for the first time. Signals that retrieval quality is sufficient for grounded response generation."
+        }
+      ],
+      "implemented_by": "EVTBUS-IMPL-1"
+    }
+  ],
+
+  "event_publisher_implementations": [
+    {
+      "id": "EVTBUS-IMPL-1",
+      "name": "LoggingEventPublisher",
+      "adapter_id": "ADAPT-17",
+      "layer": "shell",
+      "module_path": "src/shell/composition/logging_event_publisher.py",
+      "implements_ports": ["EVTBUS-PORT-1", "EVTBUS-PORT-2"],
+      "technology": "Python stdlib logging + FileHandler",
+      "output_sink": "data/domain_events.log",
+      "log_format": "[DomainEvent] <EventType> <field>=<value> ...",
+      "behavior": [
+        "Accepts the drained event list from any use case — BC-1 or BC-2",
+        "Iterates over each event and serialises it with dataclasses.asdict()",
+        "Writes a structured INFO-level log line per event via Python logging",
+        "Never raises — all exceptions are swallowed to protect the main pipeline",
+        "Configures a FileHandler once on construction — idempotent (no duplicate handlers if already registered)",
+        "Directory for the log file is created if it does not exist"
+      ],
+      "wiring": {
+        "instantiation": "Single instance created in composition root",
+        "injected_into": [
+          "StartSessionUseCase (BC-1)",
+          "ProcessTurnUseCase (BC-1)",
+          "CloseSessionUseCase (BC-1)",
+          "ProcessTurnIntelligenceUseCase (BC-2)"
+        ],
+        "constructor_signature": "LoggingEventPublisher(log_path: str)"
+      }
+    }
+  ],
+
+  "domain_event_registry": [
+    {
+      "event_id": "EVT-SS",
+      "name": "SessionStarted",
+      "bounded_context": "BC-1",
+      "module_path": "src/conversation_management/domain/events/session_started.py",
+      "emitted_by": "ConversationSession.complete_initialization()",
+      "drained_in": "StartSessionUseCase",
+      "payload": {
+        "session_id": "str",
+        "user_id": "str",
+        "school_id": "str",
+        "occurred_at": "datetime"
+      },
+      "observability_purpose": "Audit trail for session creation. Enables counting active sessions, measuring session frequency per user, and detecting initialization failures by absence."
+    },
+    {
+      "event_id": "EVT-TP",
+      "name": "TurnProcessed",
+      "bounded_context": "BC-1",
+      "module_path": "src/conversation_management/domain/events/turn_processed.py",
+      "emitted_by": "ConversationSession.complete_turn()",
+      "drained_in": "ProcessTurnUseCase",
+      "payload": {
+        "session_id": "str",
+        "turn_count": "int",
+        "intent_value": "str",
+        "occurred_at": "datetime"
+      },
+      "observability_purpose": "Audit trail for every completed turn. Enables intent distribution analysis, conversation length tracking, and per-session activity timelines."
+    },
+    {
+      "event_id": "EVT-SC",
+      "name": "SessionClosed",
+      "bounded_context": "BC-1",
+      "module_path": "src/conversation_management/domain/events/session_closed.py",
+      "emitted_by": "ConversationSession.close()",
+      "drained_in": "CloseSessionUseCase",
+      "payload": {
+        "session_id": "str",
+        "user_id": "str",
+        "occurred_at": "datetime"
+      },
+      "observability_purpose": "Audit trail for session closure. Enables session duration calculation and detection of sessions that are opened but never explicitly closed."
+    },
+    {
+      "event_id": "EVT-CU",
+      "name": "ContextUpdated",
+      "bounded_context": "BC-2",
+      "module_path": "src/decision_intelligence/domain/events/context_updated.py",
+      "emitted_by": "DecisionContext.add_signal()",
+      "drained_in": "ProcessTurnIntelligenceUseCase",
+      "payload": {
+        "session_id": "str",
+        "context_state": "str",
+        "signal_count": "int",
+        "occurred_at": "datetime"
+      },
+      "observability_purpose": "Tracks preference signal accumulation across turns. Enables analysis of how many turns it takes for users to reach context readiness and which signal types are most frequently captured."
+    },
+    {
+      "event_id": "EVT-GD",
+      "name": "GapDetected",
+      "bounded_context": "BC-2",
+      "module_path": "src/decision_intelligence/domain/events/gap_detected.py",
+      "emitted_by": "DecisionContext.record_gap_evaluation() — conditional on gaps being non-empty",
+      "drained_in": "ProcessTurnIntelligenceUseCase",
+      "payload": {
+        "session_id": "str",
+        "gaps": "list[str]",
+        "occurred_at": "datetime"
+      },
+      "observability_purpose": "Audit trail for clarification requests. Enables tracking how often context gaps block retrieval, which gap types recur most frequently, and whether clarification loops converge.",
+      "behavioral_note": "The clarification_needed=true behavioral consequence is delivered synchronously via TurnIntelligenceResultDTO — not triggered by this event. The event is purely for observability."
+    },
+    {
+      "event_id": "EVT-CR",
+      "name": "ContextReady",
+      "bounded_context": "BC-2",
+      "module_path": "src/decision_intelligence/domain/events/context_ready.py",
+      "emitted_by": "DecisionContext.mark_ready()",
+      "drained_in": "ProcessTurnIntelligenceUseCase",
+      "payload": {
+        "session_id": "str",
+        "signal_count": "int",
+        "occurred_at": "datetime"
+      },
+      "observability_purpose": "Milestone event marking the first turn where the context reached retrieval readiness. Enables measuring how many turns were required to build sufficient context for grounded retrieval."
+    }
+  ],
+
+  "event_flow": {
+    "pattern": "drain_and_publish",
+    "description": "Aggregates accumulate domain events in an internal list during domain operations. At the use-case boundary, after the domain method returns, the use case drains the list by calling collect_events() and passes the full batch to IEventPublisher.publish(). The publisher processes all events in the batch synchronously before returning.",
+    "lifecycle_steps": [
+      "1. ConversationSession or DecisionContext raises a domain event internally via self._events.append(event)",
+      "2. The domain operation (e.g. complete_turn()) returns to the use case",
+      "3. The use case calls aggregate.collect_events() — drains and clears the internal list",
+      "4. The use case calls self._event_publisher.publish(events)",
+      "5. LoggingEventPublisher iterates the batch and writes one log line per event to data/domain_events.log",
+      "6. Control returns to the use case — the event lifecycle is complete"
+    ],
+    "guarantee": "At-most-once delivery. Events are not persisted before publishing — if the process crashes between drain and publish, those events are lost. Acceptable for an observability-only log at prototype scope.",
+    "batch_semantics": "Events are published as a batch per aggregate drain, not individually. This ensures that all events from a single domain operation are written in order with no interleaving from other operations."
+  },
+
+  "folder_structure": {
+    "ports": [
+      "src/conversation_management/application/ports/i_event_publisher.py  — BC-1 IEventPublisher (EVTBUS-PORT-1)",
+      "src/decision_intelligence/application/ports/i_event_publisher.py    — BC-2 IEventPublisher (EVTBUS-PORT-2)"
+    ],
+    "implementation": [
+      "src/shell/composition/logging_event_publisher.py                    — LoggingEventPublisher (EVTBUS-IMPL-1)"
+    ],
+    "event_classes": [
+      "src/conversation_management/domain/events/session_started.py        — EVT-SS",
+      "src/conversation_management/domain/events/turn_processed.py         — EVT-TP",
+      "src/conversation_management/domain/events/session_closed.py         — EVT-SC",
+      "src/decision_intelligence/domain/events/context_updated.py          — EVT-CU",
+      "src/decision_intelligence/domain/events/gap_detected.py             — EVT-GD",
+      "src/decision_intelligence/domain/events/context_ready.py            — EVT-CR"
+    ],
+    "output_sink": [
+      "data/domain_events.log                                               — structured event log file"
+    ]
+  },
+
+  "wiring_summary": {
+    "single_instance": true,
+    "instance": "LoggingEventPublisher(log_path='data/domain_events.log')",
+    "injected_into": {
+      "BC-1": [
+        "StartSessionUseCase.__init__(event_publisher=logging_event_publisher)",
+        "ProcessTurnUseCase.__init__(event_publisher=logging_event_publisher)",
+        "CloseSessionUseCase.__init__(event_publisher=logging_event_publisher)"
+      ],
+      "BC-2": [
+        "ProcessTurnIntelligenceUseCase.__init__(event_publisher=logging_event_publisher)"
+      ]
+    }
+  },
+
+  "scope_boundary": {
+    "in_scope": [
+      "Domain event emission from ConversationSession and DecisionContext aggregates",
+      "IEventPublisher port in BC-1 and BC-2 application layers",
+      "LoggingEventPublisher shell implementation writing to data/domain_events.log",
+      "Constructor injection of the publisher into all four event-emitting use cases"
+    ],
+    "out_of_scope": [
+      "Cross-context event routing — inter-context communication uses direct port calls (COMM-1, COMM-2)",
+      "Event-driven handlers that trigger business logic — no such handlers exist in this system",
+      "Event replay or event sourcing — not required at prototype scope",
+      "Async event delivery — the synchronous RAG pipeline has no async requirements",
+      "External message brokers — Kafka, RabbitMQ, Redis Streams are out of scope",
+      "Subscribe/dispatch infrastructure — there are no subscribers; the port method is publish(), not subscribe()"
+    ]
+  }
+}

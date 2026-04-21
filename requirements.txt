@@ -1,0 +1,27 @@
+# Carton Caps Conversational Assistant — Runtime Dependencies
+# Install from the project root: pip install -r requirements.txt
+
+# API framework
+fastapi>=0.109.0
+uvicorn>=0.27.0
+
+# LLM orchestration
+langgraph>=0.1.0
+
+# OpenAI client
+openai>=1.0.0
+
+# Vector store
+qdrant-client>=1.7.0
+
+# PDF extraction (ingestion pipeline)
+pdfplumber>=0.11.0
+
+# Data validation
+pydantic>=2.0.0
+
+# Environment / configuration
+python-dotenv>=1.0.0
+
+# Type support
+typing-extensions>=4.9.0

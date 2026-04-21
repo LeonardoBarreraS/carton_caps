@@ -1,0 +1,968 @@
+{
+  "system": "Carton Caps Conversational Assistant",
+  "version": "1.0",
+  "phase": "4 — Domain Layer Materialization",
+  "task": "Domain Model Generator",
+  "derived_from": [
+    "domain_concepts.json",
+    "invariants.json",
+    "bounded_contexts.json",
+    "components.json",
+    "layered_architecture.json",
+    "process_entities.json"
+  ],
+  "design_principles": [
+    "Domain layer is pure semantics — no I/O, no frameworks, no LLM calls",
+    "Aggregates enforce their own invariants through guarded behavioral methods",
+    "Value objects are immutable and self-validating on construction",
+    "Domain events are immutable facts — past tense, minimal payload",
+    "Process entities enforce state transition guards at all times — illegal transitions raise domain errors",
+    "Identity references (User, School) are loaded externally and passed in — not resolved inside domain objects",
+    "Cross-context value objects (RetrievedEvidence, RetrievalQuery) flow as function return values — no shared imports between domain layers"
+  ],
+
+  "bounded_contexts": [
+
+    {
+      "id": "BC-1",
+      "name": "conversation_management",
+      "module_path": "src/conversation_management/domain",
+
+      "aggregates": [
+        {
+          "id": "AGG-CS",
+          "name": "ConversationSession",
+          "type": "aggregate_root",
+          "classification": "process_entity",
+          "description": "Lifecycle owner of a multi-turn user conversation. Manages session state transitions from creation to closure. Enforces turn sequencing and session-level invariants. All other workflows execute inside it.",
+          "identity": "session_id",
+          "properties": [
+            { "name": "session_id", "type": "str", "role": "identity" },
+            { "name": "user_id",    "type": "str", "role": "identity_reference" },
+            { "name": "school_id",  "type": "str", "role": "identity_reference" },
+            { "name": "status",     "type": "SessionStatus", "role": "state" },
+            { "name": "turn_count", "type": "int", "default": 0 },
+            { "name": "created_at", "type": "datetime" },
+            { "name": "updated_at", "type": "datetime" }
+          ],
+          "state_machine": {
+            "enum": "SessionStatus",
+            "states": ["created", "initializing", "active", "idle", "closed"],
+            "initial": "created",
+            "terminal": ["closed"],
+            "transitions": [
+              {
+                "from": "created",
+                "to": "initializing",
+                "trigger": "begin_initialization()",
+                "emits": null
+              },
+              {
+                "from": "initializing",
+                "to": "idle",
+                "trigger": "complete_initialization()",
+                "emits": "SessionStarted"
+              },
+              {
+                "from": "idle",
+                "to": "active",
+                "trigger": "receive_message()",
+                "emits": null
+              },
+              {
+                "from": "active",
+                "to": "idle",
+                "trigger": "complete_turn(intent, response)",
+                "emits": "TurnProcessed"
+              },
+              {
+                "from": "active",
+                "to": "idle",
+                "trigger": "fail_turn()",
+                "emits": null,
+                "note": "Rollback: restores session to idle when a turn crashes mid-execution. Allows the user to retry without starting a new session."
+              },
+              {
+                "from": "idle",
+                "to": "closed",
+                "trigger": "close()",
+                "emits": "SessionClosed"
+              }
+            ],
+            "illegal_transitions": [
+              "created → active  (must initialize first — enforces INV-CS-2)",
+              "closed → any      (terminal state — enforces INV-CS-2)",
+              "active → closed   (must return to idle first — enforces INV-CS-2)",
+              "any → initializing (only from created — enforces INV-CS-2)"
+            ]
+          },
+          "behavior": [
+            {
+              "method": "begin_initialization()",
+              "guards": ["status == created"],
+              "transitions_to": "initializing",
+              "emits": null
+            },
+            {
+              "method": "complete_initialization()",
+              "guards": ["status == initializing"],
+              "transitions_to": "idle",
+              "emits": "SessionStarted"
+            },
+            {
+              "method": "receive_message()",
+              "guards": ["status == idle"],
+              "transitions_to": "active",
+              "emits": null
+            },
+            {
+              "method": "complete_turn(intent: Intent, response: AssistantResponse)",
+              "guards": ["status == active"],
+              "side_effects": ["increments turn_count", "updates updated_at"],
+              "transitions_to": "idle",
+              "emits": "TurnProcessed"
+            },
+            {
+              "method": "fail_turn()",
+              "guards": ["status == active"],
+              "side_effects": ["updates updated_at"],
+              "transitions_to": "idle",
+              "emits": null,
+              "note": "Rollback. Called by ProcessTurnUseCase when any exception escapes the TurnGraph execution. No domain event emitted — a failed turn is not a completed turn. Session returns to idle so the user can retry."
+            },
+            {
+              "method": "close()",
+              "guards": ["status == idle"],
+              "transitions_to": "closed",
+              "emits": "SessionClosed"
+            }
+          ],
+          "factory": {
+            "method": "ConversationSession.create(user_id: str, school_id: str) → ConversationSession",
+            "produces": "ConversationSession in created state",
+            "invariants_ensured": [
+              "session_id auto-generated (UUID)",
+              "status = created",
+              "turn_count = 0"
+            ]
+          },
+          "invariants_enforced": [
+            "INV-CS-1 — status must be one of the five valid states",
+            "INV-CS-2 — state machine transition guards",
+            "INV-CS-6 — user_id must be provided (pre-resolved externally, never null)"
+          ]
+        }
+      ],
+
+      "entities": [
+        {
+          "id": "ENT-CH",
+          "name": "ConversationHistory",
+          "type": "immutable_historical_entity",
+          "description": "Persisted record of a single conversation message. Loaded at session initialization to restore prior context. Appended on each completed turn. Belongs to the user — not part of the ConversationSession consistency boundary. Created once, never mutated. Append-only log.",
+          "identity": "history_id",
+          "scope": "loaded at session init; persisted per turn via IConversationHistoryRepository",
+          "properties": [
+            { "name": "history_id",  "type": "str",        "role": "identity" },
+            { "name": "user_id",     "type": "str",        "role": "identity_reference" },
+            { "name": "session_id",  "type": "str" },
+            { "name": "message",     "type": "str" },
+            { "name": "sender",      "type": "SenderType", "values": ["user", "assistant"] },
+            { "name": "timestamp",   "type": "datetime" }
+          ],
+          "behavior": [],
+          "factory": {
+            "method": "ConversationHistory.create(user_id, session_id, message, sender) → ConversationHistory",
+            "invariants_ensured": [
+              "history_id auto-generated",
+              "sender must be a valid SenderType",
+              "message must not be empty"
+            ]
+          },
+          "invariants_enforced": []
+        }
+      ],
+
+      "value_objects": [
+        {
+          "id": "VO-USR",
+          "name": "User",
+          "type": "external_reference",
+          "description": "Identity reference for the interacting user. Pre-resolved by the external auth API before any request. Loaded from DB at session init. Never authenticated here. Immutable reference to User entity in external Auth BC — never created or mutated in this context.",
+          "identity": "user_id",
+          "scope": "read-only identity reference — loaded externally, passed into session init",
+          "properties": [
+            { "name": "user_id",   "type": "str", "role": "identity" },
+            { "name": "school_id", "type": "str", "role": "identity_reference" },
+            { "name": "name",      "type": "str", "default": "", "note": "Display name loaded from Users.name; used for LLM personalization in user-facing responses" }
+          ],
+          "behavior": [],
+          "validation": ["user_id must not be empty"],
+          "immutable": true,
+          "metadata": {
+            "classification": "external_reference",
+            "lifecycle_management": "none (pre-resolved externally)",
+            "mutability": "immutable (frozen)"
+          }
+        },
+        {
+          "id": "VO-SCH",
+          "name": "School",
+          "type": "external_reference",
+          "description": "The school the user supports. Loaded from DB at session init. Provides the fundraising anchor passed to DecisionContext as a SchoolAnchor. Immutable reference to School entity in external Master Data BC — never created or mutated in this context.",
+          "identity": "school_id",
+          "scope": "read-only identity reference — loaded at session init, passed to BC-2 as SchoolAnchor",
+          "properties": [
+            { "name": "school_id", "type": "str", "role": "identity" },
+            { "name": "name",      "type": "str" },
+            { "name": "address",   "type": "str" }
+          ],
+          "behavior": [],
+          "validation": ["school_id must not be empty", "name must not be empty"],
+          "immutable": true,
+          "metadata": {
+            "classification": "external_reference",
+            "lifecycle_management": "none (pre-resolved externally)",
+            "mutability": "immutable (frozen)"
+          }
+        },
+        {
+          "id": "VO-INT",
+          "name": "Intent",
+          "description": "Classified purpose of a user message turn. Immutable once created. Drives routing through the turn pipeline and constrains retrieval source selection.",
+          "properties": [
+            {
+              "name": "value",
+              "type": "IntentType",
+              "values": ["product_inquiry", "referral_question", "general_question", "clarification_response", "ambiguous"]
+            }
+          ],
+          "behavior": [],
+          "validation": ["value must be a valid IntentType"],
+          "immutable": true
+        },
+        {
+          "id": "VO-AR",
+          "name": "AssistantResponse",
+          "description": "Grounded response returned to the caller. Immutable once generated. Must be backed by retrieved evidence. Carries quality scores. A response that fails score thresholds must not be delivered — a fallback is returned instead.",
+          "properties": [
+            { "name": "text",                 "type": "str" },
+            { "name": "intent_answered",      "type": "IntentType" },
+            { "name": "groundedness_score",   "type": "float", "range": "[0.0, 1.0]" },
+            { "name": "relevance_score",      "type": "float", "range": "[0.0, 1.0]" },
+            { "name": "evidence_source_ids",  "type": "list[str]" },
+            { "name": "is_fallback",          "type": "bool", "default": false }
+          ],
+          "behavior": [],
+          "validation": [
+            "groundedness_score must be in [0.0, 1.0]",
+            "relevance_score must be in [0.0, 1.0]",
+            "text must not be empty"
+          ],
+          "factory": {
+            "method": "AssistantResponse.create(text, intent_answered, groundedness_score, relevance_score, evidence_source_ids) → AssistantResponse",
+            "note": "Validates scores on construction. is_fallback defaults to False."
+          },
+          "immutable": true,
+          "invariants_enforced": [
+            "INV-AR-1 — every response grounded in evidence (groundedness_score >= threshold)",
+            "INV-AR-5 — response not returned if either score is below threshold",
+            "INV-AR-6 — relevance_score computed via reverse-question; grounded-but-wrong answer is still a failure"
+          ]
+        }
+      ],
+
+      "domain_events": [
+        {
+          "id": "EVT-SS",
+          "name": "SessionStarted",
+          "emitted_by": "ConversationSession.complete_initialization()",
+          "payload": { "session_id": "str", "user_id": "str", "school_id": "str", "occurred_at": "datetime" }
+        },
+        {
+          "id": "EVT-TP",
+          "name": "TurnProcessed",
+          "emitted_by": "ConversationSession.complete_turn()",
+          "payload": { "session_id": "str", "turn_count": "int", "intent_value": "str", "occurred_at": "datetime" }
+        },
+        {
+          "id": "EVT-SC",
+          "name": "SessionClosed",
+          "emitted_by": "ConversationSession.close()",
+          "payload": { "session_id": "str", "user_id": "str", "occurred_at": "datetime" }
+        }
+      ],
+
+      "domain_services": [],
+
+      "ports": [
+        {
+          "id": "PORT-CM-1",
+          "name": "IConversationSessionRepository",
+          "type": "repository_interface",
+          "layer": "domain",
+          "operations": [
+            "save(session: ConversationSession) → None",
+            "find_by_id(session_id: str) → ConversationSession | None",
+            "find_active_by_user_id(user_id: str) → ConversationSession | None"
+          ]
+        },
+        {
+          "id": "PORT-CM-2",
+          "name": "IConversationHistoryRepository",
+          "type": "repository_interface",
+          "layer": "domain",
+          "operations": [
+            "find_by_user_id(user_id: str) → list[ConversationHistory]",
+            "append(entry: ConversationHistory) → None"
+          ]
+        },
+        {
+          "id": "PORT-CM-3",
+          "name": "IUserRepository",
+          "type": "repository_interface",
+          "layer": "domain",
+          "operations": [
+            "find_by_id(user_id: str) → User | None"
+          ]
+        },
+        {
+          "id": "PORT-CM-4",
+          "name": "ISchoolRepository",
+          "type": "repository_interface",
+          "layer": "domain",
+          "operations": [
+            "find_by_user_id(user_id: str) → School | None"
+          ]
+        },
+        {
+          "id": "PORT-CM-5",
+          "name": "IIntentClassifier",
+          "type": "service_port",
+          "layer": "application",
+          "operations": [
+            "classify(message: str) → Intent"
+          ]
+        },
+        {
+          "id": "PORT-CM-6",
+          "name": "IResponseGenerator",
+          "type": "service_port",
+          "layer": "application",
+          "operations": [
+            "generate(message: str, evidence: RetrievedEvidence, context_snapshot: dict) → AssistantResponse"
+          ]
+        },
+        {
+          "id": "PORT-CM-7",
+          "name": "IResponseEvaluator",
+          "type": "service_port",
+          "layer": "application",
+          "operations": [
+            "evaluate(response: AssistantResponse, intent: Intent, evidence: RetrievedEvidence) → AssistantResponse"
+          ],
+          "note": "Returns a new immutable AssistantResponse enriched with computed groundedness_score and relevance_score"
+        },
+        {
+          "id": "PORT-CM-8",
+          "name": "IDecisionIntelligenceService",
+          "type": "cross_context_port",
+          "layer": "application",
+          "operations": [
+            "pre_seed_context(session_id: str, school_id: str, school_name: str, purchase_signals: list[dict]) → None",
+            "process_turn(session_id: str, intent: str, message: str, turn_number: int) → RetrievedEvidence"
+          ],
+          "note": "Cross-context port to COMP-2. Defined in BC-1 application layer. Implemented in shell as a thin adapter that calls COMP-2 use cases."
+        },
+        {
+          "id": "PORT-CM-9",
+          "name": "IPurchaseHistoryRepository",
+          "type": "repository_interface",
+          "layer": "application",
+          "operations": [
+            "find_by_user_id(user_id: str) → list[dict]"
+          ],
+          "note": "Optional signal. Returns empty list gracefully if no records exist."
+        }
+      ]
+    },
+
+    {
+      "id": "BC-2",
+      "name": "decision_intelligence",
+      "module_path": "src/decision_intelligence/domain",
+
+      "aggregates": [
+        {
+          "id": "AGG-DC",
+          "name": "DecisionContext",
+          "type": "aggregate_root",
+          "classification": "process_entity",
+          "description": "The core intelligence asset of the system. Progressively accumulates user preference signals across turns. Signals are never removed — accumulation is strictly monotonic. School anchor is always present. State drives retrieval readiness. Enforces all context lifecycle invariants.",
+          "identity": "context_id",
+          "properties": [
+            { "name": "context_id",              "type": "str",                    "role": "identity", "note": "equals session_id — 1:1 with ConversationSession" },
+            { "name": "session_id",              "type": "str" },
+            { "name": "school_anchor",           "type": "SchoolAnchor",           "role": "always_present", "note": "pre-seeded at session init; never null; never changes" },
+            { "name": "signals",                 "type": "list[PreferenceSignal]", "default": [] },
+            { "name": "identified_gaps",         "type": "list[str]",              "default": [] },
+            { "name": "status",                  "type": "ContextStatus",          "role": "state" },
+            { "name": "created_at",              "type": "datetime" },
+            { "name": "updated_at",              "type": "datetime" },
+            { "name": "_pending_retrieval_intent", "type": "str | None",           "default": null, "note": "Saves the original retrieval intent when a clarification gap is detected. Cleared once retrieval is successfully resumed. Never set to a non-retrieval intent (INV-PRI-1, INV-PRI-2)." }
+          ],
+          "state_machine": {
+            "enum": "ContextStatus",
+            "states": ["empty", "partial", "ready", "enriched"],
+            "initial": "empty",
+            "terminal": [],
+            "transitions": [
+              {
+                "from": "empty",
+                "to": "partial",
+                "trigger": "add_signal() — first non-school signal extracted",
+                "emits": "ContextUpdated"
+              },
+              {
+                "from": "partial",
+                "to": "partial",
+                "trigger": "add_signal() — additional signals added, gaps remain",
+                "emits": "ContextUpdated"
+              },
+              {
+                "from": "partial",
+                "to": "ready",
+                "trigger": "mark_ready() — external gap evaluation passed by application layer",
+                "emits": "ContextReady"
+              },
+              {
+                "from": "ready",
+                "to": "enriched",
+                "trigger": "add_signal() — signal added after readiness",
+                "emits": "ContextUpdated"
+              },
+              {
+                "from": "enriched",
+                "to": "enriched",
+                "trigger": "add_signal() — further refinement",
+                "emits": "ContextUpdated"
+              }
+            ],
+            "illegal_transitions": [
+              "ready → partial    (no regression — enforces INV-DC-3)",
+              "ready → empty      (no regression — enforces INV-DC-3)",
+              "enriched → any     (no regression — enforces INV-DC-3)",
+              "empty → ready      (must pass through partial — enforces INV-DC-3)"
+            ]
+          },
+          "behavior": [
+            {
+              "method": "add_signal(signal: PreferenceSignal)",
+              "guards": ["signal not already present by key+value pair (idempotent)"],
+              "side_effects": [
+                "appends signal to signals list",
+                "transitions empty → partial if first signal",
+                "transitions ready → enriched",
+                "enriched stays enriched"
+              ],
+              "emits": "ContextUpdated"
+            },
+            {
+              "method": "record_gap_evaluation(gaps: list[str])",
+              "guards": ["status must be partial"],
+              "side_effects": ["updates identified_gaps", "emits GapDetected if gaps non-empty"],
+              "emits": "GapDetected (conditional)"
+            },
+            {
+              "method": "mark_ready()",
+              "guards": ["status == partial", "len(signals) > 0"],
+              "transitions_to": "ready",
+              "emits": "ContextReady"
+            },
+            {
+              "method": "is_ready_for_retrieval() → bool",
+              "description": "Returns True if status is ready or enriched (INV-DC-4)"
+            },
+            {
+              "method": "has_gap() → bool",
+              "description": "Returns True if status is partial and identified_gaps is non-empty"
+            },
+            {
+              "method": "set_pending_retrieval_intent(intent: str)",
+              "description": "Saves the original retrieval intent when a clarification gap is detected. Must be called before emitting clarification_needed=True so the intent can be resumed after the user answers.",
+              "guards": ["intent must be one of the retrieval intents: product_inquiry, referral_question (INV-PRI-1)"]
+            },
+            {
+              "method": "clear_pending_retrieval_intent()",
+              "description": "Clears the saved retrieval intent once retrieval has been successfully resumed. Must be called atomically when retrieval proceeds (INV-PRI-2)."
+            },
+            {
+              "method": "pending_retrieval_intent → str | None",
+              "description": "Read-only property. Returns the saved retrieval intent, or None if no pending intent is stored."
+            },
+            {
+              "method": "snapshot() → dict",
+              "description": "Returns a read-only primitive snapshot of current context state for query construction and response generation. Exposes no mutable internals. Includes pending_retrieval_intent."
+            }
+          ],
+          "factory": {
+            "method": "DecisionContext.create(session_id: str, school_anchor: SchoolAnchor) → DecisionContext",
+            "produces": "DecisionContext in empty state with school pre-seeded",
+            "invariants_ensured": [
+              "school_anchor must not be null (enforces INV-DC-2)",
+              "signals empty",
+              "status = empty",
+              "context_id = session_id"
+            ]
+          },
+          "invariants_enforced": [
+            "INV-DC-1 — status must be one of four valid states",
+            "INV-DC-2 — school_anchor always present and never null",
+            "INV-DC-3 — state never regresses; transition guards enforced",
+            "INV-DC-5 — signals accumulate monotonically; add_signal never removes",
+            "INV-DC-6 — ready/enriched requires at least one signal beyond school anchor",
+            "INV-PRI-1 — pending_retrieval_intent only set to a retrieval intent value; never to general_question, clarification_response, ambiguous, or out_of_scope",
+            "INV-PRI-2 — pending_retrieval_intent cleared atomically when retrieval is resumed; must not persist across a completed retrieval turn"
+          ]
+        }
+      ],
+
+      "entities": [],
+
+      "value_objects": [
+        {
+          "id": "VO-RQ",
+          "name": "RetrievalQuery",
+          "type": "immutable_historical_artifact",
+          "description": "Context-enriched query artifact constructed from the accumulated DecisionContext and the classified Intent. Drives knowledge source routing. Must never be constructed from the raw user message alone. Immutable; created once via factory method; represents point-in-time context snapshot passed to knowledge retrieval.",
+          "properties": [
+            { "name": "query_id",                    "type": "str" },
+            { "name": "session_id",                  "type": "str" },
+            { "name": "query_text",                  "type": "str",          "note": "enriched, constructed text — not raw user message" },
+            { "name": "source_target",               "type": "SourceTarget", "values": ["product_catalog", "referral_program_rules"] },
+            { "name": "originating_intent",          "type": "IntentType" },
+            { "name": "context_state_at_creation",   "type": "ContextStatus" },
+            { "name": "created_at",                  "type": "datetime" }
+          ],
+          "factory": {
+            "method": "RetrievalQuery.from_context(session_id: str, query_text: str, intent: IntentType, context_status: ContextStatus) → RetrievalQuery",
+            "validation_rules": [
+              "INV-RQ-1 — query_text must be constructed from context, not raw message (application layer responsibility; factory accepts only enriched text)",
+              "INV-RQ-2 — source_target derived from intent (product_inquiry → product_catalog; referral_question → referral_program_rules)",
+              "INV-RQ-3 — source_target validated against intent"
+            ]
+          },
+          "validation": [
+            "query_text must not be empty",
+            "source_target must be one of: product_catalog, referral_program_rules",
+            "originating_intent must be one of the retrieval intents (product_inquiry, referral_question)"
+          ],
+          "immutable": true,
+          "metadata": {
+            "classification": "immutable_historical_artifact",
+            "mutability": "immutable (frozen)",
+            "lifecycle": "created once, never mutated, eventually discarded"
+          }
+        },
+        {
+          "id": "VO-PS",
+          "name": "PreferenceSignal",
+          "description": "A single user preference or constraint extracted from one conversation turn. Immutable once created. Accumulated monotonically into DecisionContext.",
+          "properties": [
+            { "name": "key",          "type": "str", "examples": ["kids", "preference", "budget", "goal"] },
+            { "name": "value",        "type": "str", "examples": ["picky", "healthy", "sensitive", "support school"] },
+            { "name": "turn_number",  "type": "int" }
+          ],
+          "validation": [
+            "key must not be empty",
+            "value must not be empty",
+            "turn_number must be >= 1"
+          ],
+          "immutable": true
+        },
+        {
+          "id": "VO-RE",
+          "name": "RetrievedEvidence",
+          "description": "Immutable result of a retrieval execution. Carries retrieved content chunks and context quality scores evaluated before injection into generation. If recall falls below threshold, retrieval must be retried — this value object must not proceed to generation.",
+          "properties": [
+            { "name": "source_target",          "type": "SourceTarget" },
+            { "name": "chunks",                 "type": "list[EvidenceChunk]" },
+            { "name": "context_recall_score",   "type": "float", "range": "[0.0, 1.0]" },
+            { "name": "context_precision_score","type": "float", "range": "[0.0, 1.0]" }
+          ],
+          "nested_value_objects": [
+            {
+              "name": "EvidenceChunk",
+              "description": "A single retrieved content chunk from the knowledge store.",
+              "properties": [
+                { "name": "chunk_id",        "type": "str" },
+                { "name": "text",            "type": "str" },
+                { "name": "source_id",       "type": "str", "note": "product_id or rule_id" },
+                { "name": "relevance_score", "type": "float" }
+              ],
+              "immutable": true
+            }
+          ],
+          "behavior": [],
+          "validation": [
+            "context_recall_score in [0.0, 1.0]",
+            "context_precision_score in [0.0, 1.0]",
+            "chunks must not be empty"
+          ],
+          "immutable": true,
+          "invariants_enforced": [
+            "INV-RE-1 — context_recall_score computed after every retrieval, before injection",
+            "INV-RE-2 — context_precision_score computed after every retrieval, before injection",
+            "INV-RE-3 — if recall < threshold, retrieval must be retried; do not pass to generation",
+            "INV-RE-4 — evidence with failed quality scores must not reach generation"
+          ]
+        },
+        {
+          "id": "VO-SA",
+          "name": "SchoolAnchor",
+          "description": "Immutable value object carrying the school identity pre-seeded into DecisionContext at session init. The fundraising anchor — always present, never changes.",
+          "properties": [
+            { "name": "school_id",   "type": "str" },
+            { "name": "school_name", "type": "str" }
+          ],
+          "validation": [
+            "school_id must not be empty",
+            "school_name must not be empty"
+          ],
+          "immutable": true
+        }
+      ],
+
+      "domain_events": [
+        {
+          "id": "EVT-CU",
+          "name": "ContextUpdated",
+          "emitted_by": "DecisionContext.add_signal()",
+          "payload": { "session_id": "str", "context_state": "str", "signal_count": "int", "occurred_at": "datetime" }
+        },
+        {
+          "id": "EVT-GD",
+          "name": "GapDetected",
+          "emitted_by": "DecisionContext.record_gap_evaluation() — conditional on gaps being non-empty",
+          "payload": { "session_id": "str", "gaps": "list[str]", "occurred_at": "datetime" }
+        },
+        {
+          "id": "EVT-CR",
+          "name": "ContextReady",
+          "emitted_by": "DecisionContext.mark_ready()",
+          "payload": { "session_id": "str", "signal_count": "int", "occurred_at": "datetime" }
+        }
+      ],
+
+      "domain_services": [],
+
+      "ports": [
+        {
+          "id": "PORT-DI-1",
+          "name": "IDecisionContextRepository",
+          "type": "repository_interface",
+          "layer": "domain",
+          "operations": [
+            "save(context: DecisionContext) → None",
+            "find_by_session_id(session_id: str) → DecisionContext | None"
+          ]
+        },
+        {
+          "id": "PORT-DI-2",
+          "name": "ISignalExtractor",
+          "type": "service_port",
+          "layer": "application",
+          "operations": [
+            "extract(message: str, turn_number: int) → list[PreferenceSignal]"
+          ]
+        },
+        {
+          "id": "PORT-DI-3",
+          "name": "IEvidenceEvaluator",
+          "type": "service_port",
+          "layer": "application",
+          "operations": [
+            "evaluate(query: RetrievalQuery, evidence: RetrievedEvidence) → RetrievedEvidence"
+          ],
+          "note": "Returns evidence enriched with context_recall_score and context_precision_score. Enforces INV-RE-1, INV-RE-2."
+        },
+        {
+          "id": "PORT-DI-4",
+          "name": "IKnowledgeRetrievalService",
+          "type": "cross_context_port",
+          "layer": "application",
+          "operations": [
+            "retrieve(query: RetrievalQuery) → RetrievedEvidence"
+          ],
+          "note": "Cross-context port to COMP-3. Defined in BC-2 application layer. Implemented in shell as a thin adapter."
+        }
+      ]
+    },
+
+    {
+      "id": "BC-3",
+      "name": "knowledge_retrieval",
+      "module_path": "src/knowledge_retrieval/domain",
+      "note": "No aggregates. Products and ReferralRules are read-only external reference value objects retrieved by semantic similarity. They are never created, mutated, or owned by this BC.",
+
+      "aggregates": [],
+
+      "entities": [],
+
+      "value_objects": [
+        {
+          "id": "VO-PRD",
+          "name": "Product",
+          "type": "external_reference_value_object",
+          "description": "Immutable external reference to a purchasable catalog item. Retrieved by semantic relevance against the product_catalog vector store. Never invented by the LLM — only returned from retrieval. Sourced from external knowledge base; never created or mutated by this BC.",
+          "properties": [
+            { "name": "product_id",  "type": "str" },
+            { "name": "name",        "type": "str" },
+            { "name": "category",    "type": "str" },
+            { "name": "brand",       "type": "str" },
+            { "name": "description", "type": "str" },
+            { "name": "attributes",  "type": "dict[str, str]" }
+          ],
+          "validation": [
+            "product_id must not be empty",
+            "name must not be empty"
+          ],
+          "immutable": true,
+          "metadata": {
+            "classification": "external_reference_value_object",
+            "lifecycle_management": "none (sourced externally)",
+            "mutability": "immutable (read-only)"
+          },
+          "validation_rules": [
+            "INV-AR-2 — product recommendations must cite only products returned by retrieval"
+          ]
+        },
+        {
+          "id": "VO-RR",
+          "name": "ReferralRule",
+          "type": "external_reference_value_object",
+          "description": "Immutable external reference to a platform-defined referral program rule. Retrieved by semantic relevance against the referral_program_rules vector store. Never rewritten by the LLM. Sourced from external knowledge base; never created or mutated by this BC.",
+          "properties": [
+            { "name": "rule_id",     "type": "str" },
+            { "name": "title",       "type": "str" },
+            { "name": "description", "type": "str" },
+            { "name": "rule_type",   "type": "RuleType", "values": ["eligibility", "bonus", "invitation", "requirement"] }
+          ],
+          "validation": [
+            "rule_id must not be empty",
+            "title must not be empty",
+            "description must not be empty"
+          ],
+          "immutable": true,
+          "metadata": {
+            "classification": "external_reference_value_object",
+            "lifecycle_management": "none (platform-defined)",
+            "mutability": "immutable (read-only)"
+          },
+          "validation_rules": [
+            "INV-AR-3 — referral guidance derived exclusively from retrieved rules"
+          ]
+        }
+      ],
+
+      "domain_events": [],
+
+      "domain_services": [],
+
+      "ports": [
+        {
+          "id": "PORT-KR-1",
+          "name": "IProductRepository",
+          "type": "repository_interface",
+          "layer": "domain",
+          "operations": [
+            "search(query_text: str, top_k: int) → list[Product]"
+          ],
+          "note": "Implemented by a vector store adapter in infrastructure layer"
+        },
+        {
+          "id": "PORT-KR-2",
+          "name": "IReferralRuleRepository",
+          "type": "repository_interface",
+          "layer": "domain",
+          "operations": [
+            "search(query_text: str, top_k: int) → list[ReferralRule]"
+          ],
+          "note": "Implemented by a vector store adapter in infrastructure layer"
+        }
+      ]
+    }
+
+  ],
+
+  "enumerations": [
+    {
+      "name": "SessionStatus",
+      "values": ["created", "initializing", "active", "idle", "closed"],
+      "used_by": ["ConversationSession"],
+      "module": "src/conversation_management/domain"
+    },
+    {
+      "name": "ContextStatus",
+      "values": ["empty", "partial", "ready", "enriched"],
+      "used_by": ["DecisionContext", "RetrievalQuery"],
+      "module": "src/decision_intelligence/domain"
+    },
+    {
+      "name": "IntentType",
+      "values": ["product_inquiry", "referral_question", "general_question", "clarification_response", "ambiguous"],
+      "used_by": ["Intent", "RetrievalQuery", "AssistantResponse"],
+      "module": "src/conversation_management/domain"
+    },
+    {
+      "name": "SourceTarget",
+      "values": ["product_catalog", "referral_program_rules"],
+      "used_by": ["RetrievalQuery", "RetrievedEvidence"],
+      "module": "src/decision_intelligence/domain"
+    },
+    {
+      "name": "SenderType",
+      "values": ["user", "assistant"],
+      "used_by": ["ConversationHistory"],
+      "module": "src/conversation_management/domain"
+    },
+    {
+      "name": "RuleType",
+      "values": ["eligibility", "bonus", "invitation", "requirement"],
+      "used_by": ["ReferralRule"],
+      "module": "src/knowledge_retrieval/domain"
+    }
+  ],
+
+  "folder_structure": {
+    "note": "Each bounded context domain layer has its own module folder with subfolders by artifact type. Ports are co-located with the layer that defines the contract.",
+    "BC-1": {
+      "root": "src/conversation_management/domain/",
+      "files": [
+        "models.py                         — SessionStatus, SenderType, IntentType enumerations",
+        "entities/conversation_session.py  — ConversationSession aggregate root",
+        "entities/conversation_history.py  — ConversationHistory entity",
+        "entities/user.py                  — User identity reference",
+        "entities/school.py                — School identity reference",
+        "value_objects/intent.py           — Intent value object",
+        "value_objects/assistant_response.py — AssistantResponse value object",
+        "events/session_started.py",
+        "events/turn_processed.py",
+        "events/session_closed.py",
+        "ports/i_conversation_session_repository.py",
+        "ports/i_conversation_history_repository.py",
+        "ports/i_user_repository.py",
+        "ports/i_school_repository.py",
+        "ports/i_purchase_history_repository.py"
+      ],
+      "application_ports": [
+        "src/conversation_management/application/ports/i_intent_classifier.py",
+        "src/conversation_management/application/ports/i_response_generator.py",
+        "src/conversation_management/application/ports/i_response_evaluator.py",
+        "src/conversation_management/application/ports/i_decision_intelligence_service.py"
+      ]
+    },
+    "BC-2": {
+      "root": "src/decision_intelligence/domain/",
+      "files": [
+        "models.py                         — ContextStatus, SourceTarget enumerations",
+        "entities/decision_context.py      — DecisionContext aggregate root",
+        "value_objects/retrieval_query.py       — RetrievalQuery value object",
+        "value_objects/preference_signal.py",
+        "value_objects/retrieved_evidence.py — includes EvidenceChunk",
+        "value_objects/school_anchor.py",
+        "events/context_updated.py",
+        "events/gap_detected.py",
+        "events/context_ready.py",
+        "ports/i_decision_context_repository.py"
+      ],
+      "application_ports": [
+        "src/decision_intelligence/application/ports/i_signal_extractor.py",
+        "src/decision_intelligence/application/ports/i_evidence_evaluator.py",
+        "src/decision_intelligence/application/ports/i_knowledge_retrieval_service.py"
+      ]
+    },
+    "BC-3": {
+      "root": "src/knowledge_retrieval/domain/",
+      "files": [
+        "models.py                         — RuleType enumeration",
+        "value_objects/product.py          — Product value object",
+        "value_objects/referral_rule.py    — ReferralRule value object",
+        "value_objects/retrieved_evidence.py — local BC-3 definition; includes EvidenceChunk",
+        "ports/i_product_repository.py",
+        "ports/i_referral_rule_repository.py"
+      ]
+    }
+  },
+
+  "cross_context_flows": {
+    "note": "Value objects cross context boundaries as function return values — never as shared domain imports.",
+    "flows": [
+      {
+        "from": "BC-1 application",
+        "to": "BC-2 application",
+        "payload": "IntentType (str), message (str), session_id (str) via IDecisionIntelligenceService.process_turn()",
+        "mechanism": "direct port call; primitive DTOs only — no BC-1 domain objects imported into BC-2"
+      },
+      {
+        "from": "BC-2 application",
+        "to": "BC-3 application",
+        "payload": "RetrievalQuery passed as function argument to IKnowledgeRetrievalService.retrieve()",
+        "mechanism": "direct port call; BC-2 RetrievalQuery is passed by value"
+      },
+      {
+        "from": "BC-3",
+        "to": "BC-2",
+        "payload": "RetrievedEvidence (raw chunks, unscored)",
+        "mechanism": "return value of IKnowledgeRetrievalService.retrieve()"
+      },
+      {
+        "from": "BC-2",
+        "to": "BC-1",
+        "payload": "RetrievedEvidence (scored — context_recall_score and context_precision_score populated by IEvidenceEvaluator)",
+        "mechanism": "return value of IDecisionIntelligenceService.process_turn()"
+      }
+    ]
+  },
+
+  "invariant_enforcement_map": {
+    "note": "Domain layer enforces structural and state invariants. Application layer enforces workflow ordering, cross-boundary consistency, and quality gate invariants.",
+    "domain_layer": [
+      { "invariant": "INV-CS-1", "enforced_by": "ConversationSession state machine guard" },
+      { "invariant": "INV-CS-2", "enforced_by": "ConversationSession transition guards — illegal transitions raise domain error" },
+      { "invariant": "INV-CS-6", "enforced_by": "ConversationSession.create() — user_id must not be null" },
+      { "invariant": "INV-DC-1", "enforced_by": "DecisionContext state machine guard" },
+      { "invariant": "INV-DC-2", "enforced_by": "DecisionContext.create() — school_anchor must not be null" },
+      { "invariant": "INV-DC-3", "enforced_by": "DecisionContext transition guards — regression raises domain error" },
+      { "invariant": "INV-DC-5", "enforced_by": "DecisionContext.add_signal() — append-only; never removes" },
+      { "invariant": "INV-DC-6", "enforced_by": "DecisionContext.mark_ready() — guards len(signals) > 0" },
+      { "invariant": "INV-RQ-2", "enforced_by": "RetrievalQuery.from_context() factory — source_target derived from intent" },
+      { "invariant": "INV-RQ-3", "enforced_by": "RetrievalQuery.from_context() factory — source_target validated against intent" },
+      { "invariant": "INV-AR-5 (construction)", "enforced_by": "AssistantResponse.create() — validates score ranges on construction" }
+    ],
+    "application_layer": [
+      { "invariant": "INV-CS-3", "enforced_by": "StartSessionUseCase — school pre-seeded before first turn" },
+      { "invariant": "INV-CS-4", "enforced_by": "ProcessTurnUseCase — turn rejected if session not in active state" },
+      { "invariant": "INV-CS-5", "enforced_by": "StartSessionUseCase — checks for existing active/idle session before creating new one" },
+      { "invariant": "INV-CS-7", "enforced_by": "StartSessionUseCase — enforces one active/idle session per user" },
+      { "invariant": "INV-DC-4", "enforced_by": "DecisionIntelligenceSubgraph — retrieval only activates when intent is product_inquiry/referral_question AND context is ready/enriched" },
+      { "invariant": "INV-RQ-1", "enforced_by": "DecisionIntelligenceSubgraph — query_text constructed from context snapshot, not raw message" },
+      { "invariant": "INV-AR-1", "enforced_by": "TurnGraph evaluate_response node — groundedness_score must reach threshold" },
+      { "invariant": "INV-AR-2", "enforced_by": "IResponseGenerator — LLM grounded on retrieved product evidence only" },
+      { "invariant": "INV-AR-3", "enforced_by": "IResponseGenerator — LLM grounded on retrieved referral rules only" },
+      { "invariant": "INV-AR-4", "enforced_by": "IResponseGenerator prompt — school reference injected into generation context" },
+      { "invariant": "INV-AR-5", "enforced_by": "TurnGraph evaluate_response node — route to fallback if scores fail" },
+      { "invariant": "INV-AR-6", "enforced_by": "IResponseEvaluator — relevance_score via reverse-question technique" },
+      { "invariant": "INV-RE-1", "enforced_by": "IEvidenceEvaluator — context_recall_score computed after retrieval" },
+      { "invariant": "INV-RE-2", "enforced_by": "IEvidenceEvaluator — context_precision_score computed after retrieval" },
+      { "invariant": "INV-RE-3", "enforced_by": "DecisionIntelligenceSubgraph retry edge — recall below threshold triggers query refinement" },
+      { "invariant": "INV-RE-4", "enforced_by": "DecisionIntelligenceSubgraph — evidence with failed scores does not reach generation" },
+      { "invariant": "INV-WF-1", "enforced_by": "TurnGraph — classify_intent node executes before any other node" },
+      { "invariant": "INV-WF-2", "enforced_by": "DecisionIntelligenceSubgraph — context update before query construction" },
+      { "invariant": "INV-WF-3", "enforced_by": "TurnGraph — process_decision_intelligence node before generate_response" },
+      { "invariant": "INV-WF-4", "enforced_by": "TurnGraph — no bypass path; decision intelligence executes on every turn" },
+      { "invariant": "INV-WF-5", "enforced_by": "DecisionIntelligenceSubgraph — evaluate_evidence_quality node after retrieval, before returning evidence" },
+      { "invariant": "INV-WF-6", "enforced_by": "TurnGraph — evaluate_response node after generation, before return" }
+    ]
+  }
+}

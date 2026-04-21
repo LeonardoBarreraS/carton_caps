@@ -1,0 +1,170 @@
+{
+  "system": "Carton Caps Conversational Assistant",
+  "version": "1.0",
+  "derived_from": [
+    "domain_concepts.json",
+    "process_entities.json",
+    "invariants.json",
+    "system_workflows.json"
+  ],
+  "note": "Three bounded contexts emerge from the domain. School is a shared reference — owned by Conversation Management (loaded from DB at session init) and passed into Decision Intelligence as a pre-seeded anchor. It is not an entity inside Knowledge Retrieval.",
+  "bounded_contexts": [
+    {
+      "id": "BC-1",
+      "name": "Conversation Management",
+      "owns": "The full lifecycle of a user session from creation to close, and every conversation turn including sequencing, persistence, and response delivery.",
+      "entities": [
+        {
+          "name": "ConversationSession",
+          "type": "process_entity",
+          "role": "Primary lifecycle owner"
+        },
+        {
+          "name": "ConversationHistory",
+          "type": "immutable_historical_entity",
+          "role": "Persisted message records, loaded at session init. Append-only log — created once, never mutated."
+        }
+      ],
+      "value_objects": [
+        {
+          "name": "User",
+          "type": "external_reference",
+          "role": "Identity reference — pre-resolved by external auth API, never authenticated here. Immutable reference to User entity in external Auth BC — never created or mutated in this context."
+        },
+        {
+          "name": "School",
+          "type": "external_reference",
+          "role": "Immutable reference — loaded from DB at session init, passed to Decision Intelligence as pre-seed. Never created or mutated in this context."
+        },
+        {
+          "name": "Intent",
+          "role": "Classified per turn; drives routing to Decision Intelligence and Knowledge Retrieval"
+        },
+        {
+          "name": "AssistantResponse",
+          "role": "Grounded response returned to the caller after evidence injection"
+        }
+      ],
+      "invariants": [
+        "INV-CS-1", "INV-CS-2", "INV-CS-3", "INV-CS-4", "INV-CS-5", "INV-CS-6", "INV-CS-7",
+        "INV-WF-1", "INV-WF-3", "INV-WF-4"
+      ],
+      "responsibilities": [
+        "Manage session lifecycle (created → initializing → idle ⇄ active → closed)",
+        "Load user profile, school, conversation history, and purchase history at session start",
+        "Classify intent on every user message before any other processing",
+        "Sequence conversation turns and enforce turn ordering invariants",
+        "Persist completed turns to ConversationHistory",
+        "Assemble and return the grounded AssistantResponse to the caller"
+      ]
+    },
+    {
+      "id": "BC-2",
+      "name": "Decision Intelligence",
+      "owns": "Progressive accumulation of user preference signals and construction of every retrieval query from context — never from the raw message.",
+      "entities": [
+        {
+          "name": "DecisionContext",
+          "type": "process_entity",
+          "role": "Accumulates signals across turns; drives retrieval query construction; never regresses"
+        }
+      ],
+      "value_objects": [
+        {
+          "name": "RetrievalQuery",
+          "type": "immutable_historical_artifact",
+          "role": "Point-in-time context snapshot; constructed from intent + accumulated context; passed to Knowledge Retrieval as input artifact; immutable; never mutated"
+        },
+        {
+          "name": "PreferenceSignal",
+          "role": "Single extracted preference; immutable once created; accumulated monotonically into DecisionContext"
+        },
+        {
+          "name": "RetrievedEvidence",
+          "role": "Received from Knowledge Retrieval; passed back to Conversation Management for response injection"
+        }
+      ],
+      "invariants": [
+        "INV-DC-1", "INV-DC-2", "INV-DC-3", "INV-DC-4", "INV-DC-5", "INV-DC-6",
+        "INV-RQ-1", "INV-RQ-2", "INV-RQ-3",
+        "INV-WF-2"
+      ],
+      "responsibilities": [
+        "Extract PreferenceSignal values from each user message turn",
+        "Accumulate signals into DecisionContext monotonically — never remove signals",
+        "Evaluate context gaps and determine when context reaches ready state",
+        "Emit clarification signal when gaps prevent a meaningful recommendation",
+        "Construct RetrievalQuery from intent + accumulated DecisionContext (never raw message)",
+        "Route query to the correct knowledge source: product_catalog or referral_program_rules"
+      ]
+    },
+    {
+      "id": "BC-3",
+      "name": "Knowledge Retrieval",
+      "owns": "All knowledge sources available to the assistant and the execution of semantic retrieval against them.",
+      "entities": [
+      ],
+      "value_objects": [
+        {
+          "name": "Product",
+          "type": "external_reference_value_object",
+          "role": "Immutable external reference; sourced from knowledge base, never owned or mutated by this BC; retrieved by semantic relevance; never invented by the LLM"
+        },
+        {
+          "name": "ReferralRule",
+          "type": "external_reference_value_object",
+          "role": "Immutable external reference; platform-defined; sourced from knowledge base, never owned or mutated by this BC; retrieved by semantic relevance; never rewritten by the LLM"
+        },
+        {
+          "name": "RetrievedEvidence",
+          "role": "The result of retrieval execution; returned to Decision Intelligence for injection into response generation"
+        }
+      ],
+      "invariants": [
+        "INV-AR-1", "INV-AR-2", "INV-AR-3", "INV-AR-4"
+      ],
+      "responsibilities": [
+        "Maintain the product catalog as a semantically searchable knowledge source",
+        "Maintain referral program rules as a semantically searchable knowledge source",
+        "Execute semantic retrieval for a given RetrievalQuery",
+        "Return top-matching RetrievedEvidence to Decision Intelligence"
+      ]
+    }
+  ],
+  "context_map": {
+    "description": "Conversation Management orchestrates the turn loop. Decision Intelligence builds and routes the retrieval query. Knowledge Retrieval executes retrieval and returns evidence. Evidence flows back through Decision Intelligence to Conversation Management for grounded response assembly. This maps directly onto the RAG pipeline.",
+    "interactions": [
+      {
+        "from": "Conversation Management",
+        "to": "Decision Intelligence",
+        "payload": "classified Intent + current turn message",
+        "when": "Every turn"
+      },
+      {
+        "from": "Decision Intelligence",
+        "to": "Knowledge Retrieval",
+        "payload": "RetrievalQuery (context-enriched, never raw message)",
+        "when": "When context is partial/ready/enriched with product_inquiry or referral_question intent"
+      },
+      {
+        "from": "Knowledge Retrieval",
+        "to": "Decision Intelligence",
+        "payload": "RetrievedEvidence (top-matching results)",
+        "when": "After retrieval executes"
+      },
+      {
+        "from": "Decision Intelligence",
+        "to": "Conversation Management",
+        "payload": "RetrievedEvidence",
+        "when": "For injection into response generation"
+      }
+    ],
+    "rag_pipeline_as_context_flow": [
+      "Conversation Management classifies intent and activates the turn",
+      "Decision Intelligence builds the retrieval query from accumulated context",
+      "Knowledge Retrieval executes the query and returns evidence",
+      "Decision Intelligence passes evidence back to Conversation Management",
+      "Conversation Management assembles the grounded response and returns it to the caller"
+    ]
+  }
+}

@@ -1,0 +1,178 @@
+{
+  "system": "Carton Caps Conversational Assistant",
+  "version": "1.0",
+  "extraction_source": ["system_goal.md", "functional_requirements.json", "system_workflows.json", "overview-of-project-tables.md"],
+  "architecture_constraint": "User authentication and registration are handled by an existing external REST API. This service receives every request with a pre-resolved, trusted user_id. The user's school is known at session start and pre-seeds the DecisionContext before any conversation turn.",
+  "process_entities": [
+    {
+      "name": "ConversationSession",
+      "description": "Represents the lifecycle of a multi-turn conversation between a user and the assistant. Created on first message, evolves as turns accumulate, closed when the session ends. Holds conversation history and the current decision context. All other workflows execute inside it.",
+      "lifecycle_transitions": ["created", "initializing", "idle", "active", "closed"],
+      "derived_from": "WF0 — Conversational Response Loop",
+      "rationale": "WF0 is not a one-shot call. It is a long-running interaction process. The session is the container that makes multi-turn conversation possible."
+    },
+    {
+      "name": "DecisionContext",
+      "description": "Represents the progressively built understanding of user preferences, constraints, and fundraising intent — accumulated across conversation turns. Starts empty, grows each turn, and reaches a ready state that drives precise retrieval and personalized recommendations.",
+      "lifecycle_transitions": ["empty", "partial", "ready", "enriched"],
+      "derived_from": "WF1 — Decision Context Building",
+      "rationale": "WF1 is a multi-step process with meaningful state transitions. DecisionContext is not just data — it is the core intelligence asset of the system that improves retrieval quality over time.",
+      "key_fields": {
+        "school_anchor": "Always present; pre-seeded at session init; never changes. Provides the fundraising anchor for retrieval.",
+        "_signals": "Monotonically accumulated preference signals. Never removed once added.",
+        "_identified_gaps": "Gaps detected during the last readiness evaluation. Cleared when context transitions to ready.",
+        "_pending_retrieval_intent": "The original retrieval intent saved when a clarification gap is detected (e.g. 'product_inquiry'). Enables the clarification→resume loop. Cleared once retrieval is successfully resumed after the user answers. Never set to a non-retrieval intent."
+      }
+    }
+  ],
+  "entities": [
+    {
+      "name": "ConversationHistory",
+      "type": "immutable_historical_entity",
+      "description": "The persisted record of all messages exchanged between the user and the assistant, stored in the Conversation_History database table. Loaded at session start to restore prior context when a user returns. Enables context continuity across sessions. Append-only log — created once, never mutated.",
+      "key_attributes": ["user_id", "message", "sender", "timestamp"],
+      "sender_values": ["user", "assistant"],
+      "metadata": {
+        "classification": "immutable_historical_entity",
+        "mutability": "append-only (never updated after creation)"
+      }
+    },
+    {
+      "name": "PurchaseHistory",
+      "description": "The record of products previously purchased by the user, stored in the Purchase_History database table. Currently empty in the dataset. Designed as a future context enrichment signal — when populated, improves retrieval query construction by incorporating known purchase patterns.",
+      "key_attributes": ["user_id", "product_id", "quantity", "purchased_at"],
+      "current_state": "empty",
+      "design_decision": "Queried at session initialization as an optional signal. If empty, skipped. If populated, enriches the DecisionContext with behavioral purchase signals."
+    }
+  ],
+  "value_objects": [
+    {
+      "name": "User",
+      "type": "external_reference",
+      "description": "Identity reference for the interacting user. Pre-resolved by the external authentication API before any request reaches this service. The user's school association is loaded from the database at session initialization to pre-seed the DecisionContext. Immutable reference to User entity in external Auth BC — never created or mutated in this context.",
+      "key_attributes": ["identity", "associated_school_id"],
+      "metadata": {
+        "classification": "external_reference",
+        "lifecycle_management": "none (pre-resolved externally)",
+        "mutability": "immutable (frozen)"
+      },
+      "note": "Authentication and registration are out of scope — handled by an existing external REST API."
+    },
+    {
+      "name": "School",
+      "type": "external_reference",
+      "description": "Immutable reference to school that the user supports through their purchases. Loaded from the database at session initialization. Provides the fundraising anchor for the DecisionContext before any conversation begins. Never created or mutated in this context.",
+      "key_attributes": ["identity", "name", "address"],
+      "metadata": {
+        "classification": "external_reference",
+        "lifecycle_management": "none (pre-resolved externally)",
+        "mutability": "immutable (frozen)"
+      },
+      "note": "The school is already known when the session starts. It does not need to be inferred from conversation."
+    },
+    {
+      "name": "Intent",
+      "description": "The classification of a user message into a recognized interaction type. Immutable once classified.",
+      "values": [
+        "product_inquiry",
+        "referral_question",
+        "general_question",
+        "clarification_response",
+        "ambiguous",
+        "out_of_scope"
+      ],
+      "value_notes": {
+        "general_question": "On-domain questions about Carton Caps, the service, or the fundraising program — not specifically about a product or referral mechanics.",
+        "out_of_scope": "Messages clearly unrelated to Carton Caps (jokes, random chat, complaints, account/billing claims, insults). Routes to a polite scope-redirect; bypasses DI pipeline entirely."
+      }
+    },
+    {
+      "name": "PreferenceSignal",
+      "description": "A single preference or constraint extracted from one user message turn. Immutable once extracted. Accumulated into DecisionContext.",
+      "examples": ["kids=picky", "preference=healthy", "budget=sensitive", "goal=support school"]
+    },
+    {
+      "name": "RetrievedEvidence",
+      "description": "Content returned from a knowledge source after a retrieval query. Immutable — returned, not constructed. Carries context quality scores evaluated before injection into generation.",
+      "types": ["product_evidence", "referral_rule_evidence"],
+      "evaluation_fields": [
+        {
+          "field": "context_recall_score",
+          "type": "float 0-1",
+          "meaning": "Measures whether retrieval returned all relevant knowledge needed to answer the query. Computed after retrieval, before evidence injection."
+        },
+        {
+          "field": "context_precision_score",
+          "type": "float 0-1",
+          "meaning": "Measures the proportion of retrieved chunks that are actually relevant. Low precision means noisy context enters the LLM."
+        }
+      ],
+      "design_rule": "If context_recall_score falls below minimum threshold, the retrieval query must be refined and retrieval retried before injection proceeds. Evidence with degraded context scores must not be passed to generation."
+    },
+    {
+      "name": "AssistantResponse",
+      "description": "The grounded text response returned to the user. Immutable once generated. Always derived from retrieved evidence and the current decision context. Carries evaluation scores that enforce grounding and relevance invariants.",
+      "evaluation_fields": [
+        {
+          "field": "groundedness_score",
+          "type": "float 0-1",
+          "meaning": "Measures whether every claim in the response is traceable to a retrieved evidence chunk. Replaces the boolean grounded_in_evidence. The boolean is derived: score >= threshold."
+        },
+        {
+          "field": "relevance_score",
+          "type": "float 0-1",
+          "meaning": "Measures whether the response actually addresses the user's intent. Computed using the reverse-question technique: what question would this answer respond to? Compared semantically to the original intent."
+        }
+      ],
+      "design_rule": "A response must not be returned to the caller if either groundedness_score or relevance_score falls below the minimum threshold. A safe fallback message is returned instead."
+    },
+    {
+      "name": "Product",
+      "type": "external_reference_value_object",
+      "description": "An item available in the platform catalog. Has identity and attributes matched during retrieval. The assistant only recommends products returned by retrieval — never invented ones. Immutable external reference sourced from knowledge base; never created or mutated by this context.",
+      "key_attributes": ["identity", "name", "category", "brand", "attributes"],
+      "metadata": {
+        "classification": "external_reference_value_object",
+        "lifecycle_management": "none (sourced externally)",
+        "mutability": "immutable (read-only)"
+      }
+    },
+    {
+      "name": "RetrievalQuery",
+      "type": "immutable_historical_artifact",
+      "description": "A query constructed from the accumulated decision context and the detected intent. Not the raw user message — it is derived, enriched, and purposeful. The direct input to the knowledge retrieval step. Immutable point-in-time context snapshot; created once via factory method, never mutated.",
+      "key_attributes": ["constructed_text", "source_target", "originating_intent"],
+      "source_target_values": ["product_catalog", "referral_program_rules"],
+      "metadata": {
+        "classification": "immutable_historical_artifact",
+        "mutability": "immutable (frozen)"
+      }
+    },
+    {
+      "name": "ReferralRule",
+      "type": "external_reference_value_object",
+      "description": "A specific rule from the referral program (eligibility condition, bonus mechanic, invitation requirement). Immutable — defined by the platform, not the user. Immutable external reference sourced from knowledge base; never created or mutated by this context.",
+      "examples": ["must use referral link", "must complete onboarding", "must link school", "both parties receive bonus"],
+      "metadata": {
+        "classification": "external_reference_value_object",
+        "lifecycle_management": "none (platform-defined)",
+        "mutability": "immutable (read-only)"
+      }
+    }
+  ],
+  "domain_language": [
+    { "term": "ConversationSession", "meaning": "The stateful container of a multi-turn user interaction" },
+    { "term": "DecisionContext", "meaning": "The accumulated structured understanding of user preferences and fundraising intent" },
+    { "term": "PreferenceSignal", "meaning": "A single piece of user intent or preference extracted from a message" },
+    { "term": "Intent", "meaning": "The classified purpose of a user message" },
+    { "term": "RetrievalQuery", "meaning": "A context-enriched query constructed to retrieve relevant evidence from a knowledge source" },
+    { "term": "RetrievedEvidence", "meaning": "Content returned from a knowledge source; carries context_recall_score and context_precision_score evaluated before injection into generation" },
+    { "term": "Product", "meaning": "A purchasable item from the platform catalog" },
+    { "term": "School", "meaning": "The school the user supports; known at session start; anchors the fundraising context" },
+    { "term": "ConversationHistory", "meaning": "Persisted message records for a user, loaded at session start to restore prior context" },
+    { "term": "PurchaseHistory", "meaning": "Persisted purchase records; optional context enrichment signal; empty now, designed for future use" },
+    { "term": "ReferralRule", "meaning": "A platform-defined rule governing referral eligibility or rewards" },
+    { "term": "AssistantResponse", "meaning": "The grounded, evidence-backed reply produced by the assistant; carries groundedness_score and relevance_score enforcing domain invariants" },
+    { "term": "User", "meaning": "A parent or shopper with pre-resolved identity, engaging the assistant to support their school" }
+  ]
+}

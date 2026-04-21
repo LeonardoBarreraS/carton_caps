@@ -1,0 +1,141 @@
+{
+  "system": "Carton Caps Conversational Assistant",
+  "version": "1.0",
+  "note": "WF2 (Product Recommendation) and WF3 (Referral Guidance) are not independent process entities. They activate and complete within a single turn and have no sustained lifecycle. They are behavioral steps inside ConversationSession.",
+  "process_entities": [
+    {
+      "name": "ConversationSession",
+      "type": "primary",
+      "represents": "The full lifecycle of a multi-turn interaction between a user and the assistant. Container for all conversation state: current turn, DecisionContext, and history. All behavioral workflows execute inside it.",
+      "derived_from": "WF0 — Conversational Response Loop",
+      "lifecycle": ["created", "initializing", "active", "idle", "closed"],
+      "states": [
+        {
+          "name": "created",
+          "meaning": "Session record exists. User identity and session ID established."
+        },
+        {
+          "name": "initializing",
+          "meaning": "User profile, school, ConversationHistory, and PurchaseHistory being loaded from DB. DecisionContext being pre-seeded."
+        },
+        {
+          "name": "active",
+          "meaning": "Session is processing a turn. A user message has been received and is being handled."
+        },
+        {
+          "name": "idle",
+          "meaning": "Turn completed. Session is waiting for the next user message."
+        },
+        {
+          "name": "closed",
+          "meaning": "Session has ended. No further turns will be processed. Terminal state.",
+          "terminal": true
+        }
+      ],
+      "transitions": [
+        { "from": "created", "to": "initializing", "trigger": "session init begins: load user profile, school, conversation history, purchase history" },
+        { "from": "initializing", "to": "idle", "trigger": "initialization complete, DecisionContext pre-seeded" },
+        { "from": "idle", "to": "active", "trigger": "new user message received" },
+        { "from": "active", "to": "idle", "trigger": "turn completed, response returned" },
+        { "from": "active", "to": "idle", "trigger": "turn failed mid-execution (any uncaught exception) — rollback via fail_turn(); no event emitted; user can retry" },
+        { "from": "idle", "to": "closed", "trigger": "session timeout or explicit close" }
+      ],
+      "responsibilities": [
+        "Own the conversation lifecycle from creation to close",
+        "Hold and provide access to the current DecisionContext",
+        "Sequence conversation turns",
+        "Persist turns to ConversationHistory",
+        "Coordinate session initialization (loading DB data)"
+      ],
+      "not_responsible_for": [
+        "Executing retrieval",
+        "Calling LLM directly",
+        "Routing to workflows — that is application orchestration"
+      ],
+      "domain_events": [
+        {
+          "name": "SessionStarted",
+          "emitted_when": "Session moves from initializing to idle (ready for first turn)"
+        },
+        {
+          "name": "TurnProcessed",
+          "emitted_when": "Session moves from active to idle (turn completed)"
+        },
+        {
+          "name": "SessionClosed",
+          "emitted_when": "Session moves to closed"
+        }
+      ]
+    },
+    {
+      "name": "DecisionContext",
+      "type": "secondary",
+      "represents": "The progressively built, structured understanding of user preferences, constraints, and fundraising intent. Starts pre-seeded with the user's school. Grows each turn. Its state is the primary input for retrieval query construction.",
+      "derived_from": "WF1 — Decision Context Building",
+      "lifecycle": ["empty", "partial", "ready", "enriched"],
+      "states": [
+        {
+          "name": "empty",
+          "meaning": "No conversation signals yet. Only school anchor present (pre-seeded). Not sufficient for recommendation."
+        },
+        {
+          "name": "partial",
+          "meaning": "Some preference signals accumulated. Gaps still exist. Clarification may be needed."
+        },
+        {
+          "name": "ready",
+          "meaning": "Sufficient signals to construct a meaningful retrieval query and generate a recommendation."
+        },
+        {
+          "name": "enriched",
+          "meaning": "Multiple turns have added depth. Retrieval queries are highly precise."
+        }
+      ],
+      "transitions": [
+        { "from": "empty", "to": "partial", "trigger": "first PreferenceSignal extracted from user message" },
+        { "from": "partial", "to": "partial", "trigger": "more signals added, gaps remain" },
+        { "from": "partial", "to": "ready", "trigger": "gap evaluation passes — sufficient signals for recommendation" },
+        { "from": "ready", "to": "enriched", "trigger": "further signals continue to improve retrieval precision" },
+        { "from": "enriched", "to": "enriched", "trigger": "additional signals further refine context" }
+      ],
+      "note": "Once ready, context never regresses. Signals accumulate monotonically.",
+      "fields": [
+        { "field": "school", "source": "user profile (DB, session init)", "always_present": true },
+        { "field": "preference_signals", "source": "extracted from conversation", "always_present": false },
+        { "field": "fundraising_intent", "source": "extracted from conversation", "always_present": false },
+        { "field": "purchase_signals", "source": "PurchaseHistory (DB, session init)", "always_present": false, "note": "optional — skipped if empty" },
+        { "field": "identified_gaps", "source": "gap evaluation step (WF1)", "always_present": false }
+      ],
+      "responsibilities": [
+        "Accumulate PreferenceSignal values across turns",
+        "Track identified gaps and determine when context is ready",
+        "Expose current state as the primary input for RetrievalQuery construction",
+        "Anchor fundraising context via the pre-seeded school"
+      ],
+      "not_responsible_for": [
+        "Constructing the retrieval query — that is an application-layer operation",
+        "Executing retrieval",
+        "Generating responses"
+      ],
+      "domain_events": [
+        {
+          "name": "ContextUpdated",
+          "emitted_when": "A new PreferenceSignal is added and state changes"
+        },
+        {
+          "name": "GapDetected",
+          "emitted_when": "Gap evaluation finds the context insufficient for recommendation"
+        },
+        {
+          "name": "ContextReady",
+          "emitted_when": "Context transitions to ready state for the first time"
+        }
+      ]
+    }
+  ],
+  "entity_relationship": {
+    "description": "ConversationSession owns DecisionContext. During initialization, ConversationSession creates and pre-seeds DecisionContext. Each turn updates DecisionContext state. DecisionContext.state determines whether WF2 activates.",
+    "ownership": "ConversationSession → owns → DecisionContext",
+    "state_drives": "DecisionContext.state → drives → RetrievalQuery construction → RAG pipeline (WF2 / WF3)"
+  }
+}

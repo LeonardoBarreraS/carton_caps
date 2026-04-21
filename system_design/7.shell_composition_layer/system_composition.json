@@ -1,0 +1,345 @@
+{
+  "system": "Carton Caps Conversational Assistant",
+  "version": "1.0",
+  "phase": "7 — Shell / Composition Layer",
+  "task": "System Composition",
+  "derived_from": [
+    "dependency_wiring.json",
+    "api_entrypoints.json",
+    "use_cases.json",
+    "adapters.json",
+    "event_bus.json"
+  ],
+  "composition_files": {
+    "app_factory":   "src/shell/api/app.py",
+    "router":        "src/shell/api/router.py",
+    "schemas":       "src/shell/api/schemas.py",
+    "entry_point":   "main.py"
+  },
+
+  "design_principles": [
+    "System composition turns the wired object graph into a running application",
+    "create_app() is the sole factory — it is the composition boundary between wiring and runtime",
+    "build_container() is called exactly once inside create_app() — use case instances are shared across all requests",
+    "Route handlers call use cases exclusively — no domain objects, repositories, or adapters are imported in the API layer",
+    "Exception handlers are registered at app level — route handlers never catch use-case exceptions themselves",
+    "The API layer contains no domain logic — request validation is structural (Pydantic), semantic validation belongs to use cases and domain",
+    "ASGI server (uvicorn) is the runtime host — the entry point is main.py at the workspace root",
+    "System composition must not reinvent what dependency wiring already assembled — it only bootstraps and starts"
+  ],
+
+  "runtime_type": {
+    "type": "HTTP server",
+    "framework": "FastAPI",
+    "server": "uvicorn (ASGI)",
+    "mode": "synchronous — no background tasks, no async queues",
+    "run_command": "uvicorn main:app --host 0.0.0.0 --port 8000 --reload",
+    "auto_docs": [
+      "http://localhost:8000/docs  (Swagger UI)",
+      "http://localhost:8000/redoc (ReDoc)"
+    ]
+  },
+
+  "bootstrap_sequence": [
+    {
+      "step": 1,
+      "action": "ASGI server loads entry point",
+      "detail": "uvicorn imports main.py and resolves the `app` module-level variable",
+      "file": "main.py"
+    },
+    {
+      "step": 2,
+      "action": "App factory called",
+      "detail": "main.py calls create_app() which creates the FastAPI instance",
+      "file": "src/shell/api/app.py"
+    },
+    {
+      "step": 3,
+      "action": "Composition root executed",
+      "detail": "create_app() calls build_container() — assembles full object graph (all infrastructure, adapters, use cases). See dependency_wiring.json for the full wiring order.",
+      "file": "src/shell/composition/container.py"
+    },
+    {
+      "step": 4,
+      "action": "Router built and included",
+      "detail": "build_router(container) creates an APIRouter with all 3 route handlers bound to the wired use cases. The router is included in the app with app.include_router().",
+      "file": "src/shell/api/router.py"
+    },
+    {
+      "step": 5,
+      "action": "Exception handlers registered",
+      "detail": "All 9 domain exception handlers are registered on the FastAPI app instance. They map use-case exceptions to HTTP status codes and structured error responses.",
+      "file": "src/shell/api/app.py"
+    },
+    {
+      "step": 6,
+      "action": "App returned and served",
+      "detail": "create_app() returns the fully configured FastAPI instance. uvicorn begins serving requests.",
+      "file": "main.py"
+    }
+  ],
+
+  "entry_point": {
+    "file": "main.py",
+    "location": "workspace root",
+    "content": "import sys, os; sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src')); from shell.api.app import create_app; app = create_app()",
+    "note": "src/ is inserted into sys.path so all bounded-context packages resolve without installation. The `app` variable is the ASGI application instance consumed by uvicorn."
+  },
+
+  "route_handlers": [
+    {
+      "id": "RH-1",
+      "handler_function": "start_session",
+      "file": "src/shell/api/router.py",
+      "method": "POST",
+      "path": "/sessions",
+      "http_status_success": 201,
+      "request_schema": "StartSessionRequest",
+      "response_schema": "StartSessionResponse",
+      "use_case": "StartSessionUseCase",
+      "command": "StartSessionCommand",
+      "command_fields": {
+        "user_id": "request.user_id"
+      },
+      "response_fields": {
+        "session_id": "result.session_id",
+        "status": "result.status"
+      },
+      "description": "Creates and fully initialises a ConversationSession. Loads user, school, history. Pre-seeds DecisionContext in BC-2. Returns session_id for all subsequent calls."
+    },
+    {
+      "id": "RH-2",
+      "handler_function": "process_turn",
+      "file": "src/shell/api/router.py",
+      "method": "POST",
+      "path": "/sessions/{session_id}/turns",
+      "http_status_success": 200,
+      "request_schema": "ProcessTurnRequest",
+      "response_schema": "ProcessTurnResponse",
+      "use_case": "ProcessTurnUseCase",
+      "command": "ProcessTurnCommand",
+      "command_fields": {
+        "session_id": "path parameter",
+        "user_id": "request.user_id",
+        "message": "request.message"
+      },
+      "response_fields": {
+        "session_id": "result.session_id",
+        "response_text": "result.response_text",
+        "intent": "result.intent",
+        "is_fallback": "result.is_fallback",
+        "groundedness_score": "result.groundedness_score",
+        "relevance_score": "result.relevance_score"
+      },
+      "description": "Submits a user message. Runs the full RAG turn pipeline: intent classification → decision intelligence → knowledge retrieval → response generation → evaluation. Returns the grounded assistant response."
+    },
+    {
+      "id": "RH-3",
+      "handler_function": "close_session",
+      "file": "src/shell/api/router.py",
+      "method": "DELETE",
+      "path": "/sessions/{session_id}",
+      "http_status_success": 200,
+      "request_schema": "CloseSessionRequest",
+      "response_schema": "CloseSessionResponse",
+      "use_case": "CloseSessionUseCase",
+      "command": "CloseSessionCommand",
+      "command_fields": {
+        "session_id": "path parameter",
+        "user_id": "request.user_id"
+      },
+      "response_fields": {
+        "session_id": "result.session_id",
+        "status": "result.status"
+      },
+      "description": "Transitions the session to the closed terminal state. Only idle sessions can be closed. The requesting user must own the session."
+    }
+  ],
+
+  "pydantic_schemas": {
+    "file": "src/shell/api/schemas.py",
+    "requests": [
+      {
+        "name": "StartSessionRequest",
+        "fields": [{ "name": "user_id", "type": "str" }]
+      },
+      {
+        "name": "ProcessTurnRequest",
+        "fields": [
+          { "name": "user_id", "type": "str" },
+          { "name": "message", "type": "str" }
+        ]
+      },
+      {
+        "name": "CloseSessionRequest",
+        "fields": [{ "name": "user_id", "type": "str" }]
+      }
+    ],
+    "responses": [
+      {
+        "name": "StartSessionResponse",
+        "fields": [
+          { "name": "session_id", "type": "str" },
+          { "name": "status",     "type": "str", "note": "Always 'idle' on success" }
+        ]
+      },
+      {
+        "name": "ProcessTurnResponse",
+        "fields": [
+          { "name": "session_id",         "type": "str" },
+          { "name": "response_text",       "type": "str" },
+          { "name": "intent",              "type": "str" },
+          { "name": "is_fallback",         "type": "bool" },
+          { "name": "groundedness_score",  "type": "float", "note": "0.0–1.0; how well the response is grounded in retrieved evidence" },
+          { "name": "relevance_score",     "type": "float", "note": "0.0–1.0; how well the response answers the user's question" }
+        ]
+      },
+      {
+        "name": "CloseSessionResponse",
+        "fields": [
+          { "name": "session_id", "type": "str" },
+          { "name": "status",     "type": "str", "note": "Always 'closed' on success" }
+        ]
+      }
+    ],
+    "error_envelope": {
+      "name": "ErrorResponse",
+      "fields": [
+        { "name": "error_code", "type": "str" },
+        { "name": "message",    "type": "str" }
+      ],
+      "example": {
+        "error_code": "SESSION_NOT_FOUND",
+        "message": "Session 'sess-a1b2c3' not found."
+      }
+    }
+  },
+
+  "exception_handler_registry": {
+    "registration_location": "src/shell/api/app.py (inside create_app())",
+    "registration_rule": "Registered at app level — route handlers never catch exceptions",
+    "handlers": [
+      {
+        "id": "EH-1",
+        "exception_class": "SessionConflictError",
+        "source_module": "start_session_use_case",
+        "http_status": 409,
+        "error_code": "SESSION_CONFLICT"
+      },
+      {
+        "id": "EH-2",
+        "exception_class": "UserNotFoundError",
+        "source_module": "start_session_use_case",
+        "http_status": 404,
+        "error_code": "USER_NOT_FOUND"
+      },
+      {
+        "id": "EH-3",
+        "exception_class": "SchoolNotFoundError",
+        "source_module": "start_session_use_case",
+        "http_status": 404,
+        "error_code": "SCHOOL_NOT_FOUND"
+      },
+      {
+        "id": "EH-4",
+        "exception_class": "SessionNotFoundError",
+        "source_module": "process_turn_use_case",
+        "http_status": 404,
+        "error_code": "SESSION_NOT_FOUND",
+        "note": "Aliased as TurnSessionNotFoundError in app.py to avoid name collision with EH-5"
+      },
+      {
+        "id": "EH-5",
+        "exception_class": "SessionNotFoundError",
+        "source_module": "close_session_use_case",
+        "http_status": 404,
+        "error_code": "SESSION_NOT_FOUND",
+        "note": "Aliased as CloseSessionNotFoundError in app.py to avoid name collision with EH-4. Same HTTP mapping."
+      },
+      {
+        "id": "EH-6",
+        "exception_class": "SessionOwnershipError",
+        "source_module": "process_turn_use_case",
+        "http_status": 403,
+        "error_code": "OWNERSHIP_MISMATCH"
+      },
+      {
+        "id": "EH-7",
+        "exception_class": "InvalidTurnStateError",
+        "source_module": "process_turn_use_case",
+        "http_status": 422,
+        "error_code": "INVALID_SESSION_STATE"
+      },
+      {
+        "id": "EH-8",
+        "exception_class": "AuthorizationError",
+        "source_module": "close_session_use_case",
+        "http_status": 403,
+        "error_code": "AUTHORIZATION_ERROR"
+      },
+      {
+        "id": "EH-9",
+        "exception_class": "InvalidSessionTransitionError",
+        "source_module": "conversation_session (domain entity)",
+        "http_status": 409,
+        "error_code": "INVALID_STATE_TRANSITION"
+      }
+    ]
+  },
+
+  "request_flow": {
+    "description": "Every HTTP request follows the same strict inward-only path through the architecture layers.",
+    "flow": [
+      "1. HTTP request arrives at uvicorn",
+      "2. FastAPI routes to the matching handler in router.py",
+      "3. Pydantic validates the request body schema (structural validation only)",
+      "4. Route handler builds a use-case Command from request fields",
+      "5. Route handler calls use_case.execute(command)",
+      "6. Use case orchestrates domain objects, adapters, and repositories",
+      "7. Use case returns a Response dataclass",
+      "8. Route handler maps Response fields to a Pydantic response schema",
+      "9. FastAPI serializes the response to JSON and returns it",
+      "10. If a domain exception is raised at step 6, the registered exception handler intercepts it and returns a structured ErrorResponse"
+    ],
+    "dependency_direction": "HTTP → router.py → use_case → domain / infrastructure (never upward)"
+  },
+
+  "scope_boundary": {
+    "in_scope": [
+      "FastAPI app factory (create_app) in src/shell/api/app.py",
+      "Three route handlers in src/shell/api/router.py",
+      "Pydantic request/response/error schemas in src/shell/api/schemas.py",
+      "Nine exception-to-HTTP-status mappings registered at app level",
+      "ASGI entry point in main.py at workspace root"
+    ],
+    "out_of_scope": [
+      "Authentication / authorization middleware — user_id is treated as pre-resolved trusted identity at prototype scope",
+      "Rate limiting — not required at prototype scope",
+      "CORS configuration — not required unless a browser client is added",
+      "Health check endpoint — not required by the deliverable",
+      "GraphQL, CLI, or webhook entry points — REST is the sole delivery channel",
+      "Background tasks or async queues — the RAG pipeline is synchronous by design",
+      "OpenAPI customization beyond FastAPI defaults"
+    ]
+  },
+
+  "pending_from_dependency_wiring": {
+    "ref": "GAP-1 in dependency_wiring.json",
+    "summary": "SQLiteRAGMetricsLogger (ADAPT-15) is implemented but not wired into ProcessTurnUseCase or build_container(). The system composition layer itself needs no change for this gap — it is resolved entirely within the dependency wiring (container.py) and the ProcessTurnUseCase constructor. System composition is not affected."
+  },
+
+  "composition_rules": {
+    "must": [
+      "build_container() called once inside create_app() — never at module level or per-request",
+      "All exception handlers registered inside create_app() before the app is returned",
+      "Route handlers receive the container by constructor injection via build_router(container)",
+      "API layer imports only: composition container, use-case command/response classes, Pydantic schemas"
+    ],
+    "must_not": [
+      "No domain logic in route handlers or app factory",
+      "No repository, adapter, or infrastructure import in src/shell/api/",
+      "No per-request wiring — object graph is immutable after startup",
+      "No try/except blocks in route handlers — exceptions bubble to app-level handlers"
+    ]
+  }
+}

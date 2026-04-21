@@ -1,0 +1,630 @@
+{
+  "system": "Carton Caps Conversational Assistant",
+  "version": "1.0",
+  "phase": "3 — Domain-Driven Architecture",
+  "task": "Layered Architecture Generation",
+  "derived_from": ["bounded_contexts.json", "components.json"],
+  "architecture_pattern": "Clean Architecture",
+  "dependency_rule": "Dependencies point inward: infrastructure → application → domain. Domain depends on nothing. COMP-4 (shell) wires all components — it is the only module that imports across component boundaries.",
+  "note": "COMP-4 (shell) is the system-level shell. The three domain components (COMP-1, COMP-2, COMP-3) do not have an internal shell layer — they expose their behavior through application use cases and ports. The shell component calls those use cases.",
+
+  "components": [
+    {
+      "id": "COMP-1",
+      "name": "conversation_management",
+      "module_path": "src/conversation_management",
+      "layers": {
+        "domain": {
+          "path": "src/conversation_management/domain",
+          "responsibility": "Pure domain model for conversation lifecycle. Owns session state transitions, history records, user and school identity references, and grounded response production. Enforces all INV-CS-* and INV-WF-* invariants. No framework, no I/O.",
+          "artifacts": [
+            {
+              "type": "process_entity",
+              "name": "ConversationSession",
+              "purpose": "Lifecycle owner of a multi-turn conversation. Manages state transitions (created → initializing → idle ⇄ active → closed). Enforces INV-CS-1 through INV-CS-7 and turn sequencing invariants."
+            },
+            {
+              "type": "entity",
+              "name": "ConversationHistory",
+              "purpose": "Persisted record of all turns for a user. Loaded at session init to restore prior context."
+            },
+            {
+              "type": "entity",
+              "name": "User",
+              "purpose": "Identity reference. Pre-resolved by external auth; never authenticated here. Carries user_id and school affiliation."
+            },
+            {
+              "type": "entity",
+              "name": "School",
+              "purpose": "School the user supports. Loaded from DB at session init. Anchors the fundraising context pre-seeded into DecisionContext."
+            },
+            {
+              "type": "value_object",
+              "name": "Intent",
+              "purpose": "Classified purpose of a user message turn. Immutable once created. Values: product_inquiry, referral_question, general_question, clarification_response, ambiguous, out_of_scope."
+            },
+            {
+              "type": "value_object",
+              "name": "AssistantResponse",
+              "purpose": "Grounded response returned to the caller. Immutable. Carries groundedness_score and relevance_score. Must meet score thresholds before delivery (INV-AR-1, INV-AR-5, INV-AR-6)."
+            },
+            {
+              "type": "domain_event",
+              "name": "SessionStarted",
+              "purpose": "Emitted when session transitions from initializing to idle (ready for first turn)."
+            },
+            {
+              "type": "domain_event",
+              "name": "TurnProcessed",
+              "purpose": "Emitted when session transitions from active to idle (turn completed, response returned)."
+            },
+            {
+              "type": "domain_event",
+              "name": "SessionClosed",
+              "purpose": "Emitted when session enters closed state."
+            },
+            {
+              "type": "repository_interface",
+              "name": "IConversationSessionRepository",
+              "purpose": "Defines persistence contract for ConversationSession lifecycle."
+            },
+            {
+              "type": "repository_interface",
+              "name": "IConversationHistoryRepository",
+              "purpose": "Defines read contract for loading conversation history at session init."
+            },
+            {
+              "type": "repository_interface",
+              "name": "IUserRepository",
+              "purpose": "Defines read contract for loading User identity by user_id."
+            },
+            {
+              "type": "repository_interface",
+              "name": "ISchoolRepository",
+              "purpose": "Defines read contract for loading the School associated with a user."
+            },
+            {
+              "type": "repository_interface",
+              "name": "IPurchaseHistoryRepository",
+              "purpose": "Defines read contract for loading PurchaseHistory at session init. Optional signal \u2014 skipped if empty."
+            }
+          ]
+        },
+        "application": {
+          "path": "src/conversation_management/application",
+          "responsibility": "Orchestrates the conversation turn loop. Invokes domain transitions. Calls external ports for intent classification, response generation, and response evaluation. Coordinates with Decision Intelligence. LangGraph is the execution engine for the turn loop — nodes are thin wrappers that call ports; domain logic stays in the domain layer.",
+          "orchestration_engine": "LangGraph",
+          "artifacts": [
+            {
+              "type": "use_case",
+              "name": "StartSessionUseCase",
+              "purpose": "Initializes a ConversationSession: resolves User and School, loads ConversationHistory and PurchaseHistory, pre-seeds DecisionContext via IDecisionIntelligenceService, transitions session to idle."
+            },
+            {
+              "type": "use_case",
+              "name": "ProcessTurnUseCase",
+              "purpose": "Entry point for a single conversation turn. Delegates execution to TurnGraph. Returns validated AssistantResponse to caller."
+            },
+            {
+              "type": "use_case",
+              "name": "CloseSessionUseCase",
+              "purpose": "Transitions ConversationSession to closed state. Final persistence of session state."
+            },
+            {
+              "type": "langgraph_graph",
+              "name": "TurnGraph",
+              "purpose": "LangGraph graph that executes the full conversation turn pipeline. Replaces the imperative body of ProcessTurnUseCase. Nodes call ports — no domain logic inside nodes.",
+              "nodes": [
+                "classify_intent",
+                "process_decision_intelligence",
+                "generate_response",
+                "evaluate_response",
+                "persist_turn",
+                "generate_clarification",
+                "return_fallback"
+              ],
+              "conditional_edges": [
+                "classify_intent → [product_inquiry | referral_question | clarification_response] → process_decision_intelligence",
+                "classify_intent → general_question → generate_redirect",
+                "classify_intent → out_of_scope → handle_out_of_scope",
+                "classify_intent → ambiguous → generate_clarification",
+                "process_decision_intelligence → clarification_needed → generate_clarification",
+                "evaluate_response → scores_pass → persist_turn",
+                "evaluate_response → scores_fail → return_fallback"
+              ]
+            },
+            {
+              "type": "langgraph_state",
+              "name": "TurnGraphState",
+              "purpose": "Typed state schema flowing through TurnGraph. Carries only turn-scoped primitives — no domain objects. Fields: user_id, session_id, message, intent, evidence_chunks, evidence_type, response_text, groundedness_score, relevance_score, clarification_needed."
+            },
+            {
+              "type": "port",
+              "name": "IIntentClassifier",
+              "purpose": "Outbound port. Contract for classifying an Intent from a user message. Implemented in infrastructure by an LLM adapter."
+            },
+            {
+              "type": "port",
+              "name": "IResponseGenerator",
+              "purpose": "Outbound port. Contract for generating a grounded AssistantResponse from RetrievedEvidence + DecisionContext snapshot. Implemented by an LLM adapter."
+            },
+            {
+              "type": "port",
+              "name": "IResponseEvaluator",
+              "purpose": "Outbound port. Contract for computing groundedness_score and relevance_score on AssistantResponse. Enforces INV-AR-1, INV-AR-5, INV-AR-6."
+            },
+            {
+              "type": "port",
+              "name": "IDecisionIntelligenceService",
+              "purpose": "Outbound port to COMP-2. Contract for processing a turn through Decision Intelligence and receiving RetrievedEvidence. Crossed at the application layer — no domain objects from COMP-2 imported into domain layer."
+            },
+            {
+              "type": "port",
+              "name": "IRAGMetricsLogger",
+              "purpose": "Outbound observability port. Contract for persisting per-turn RAG evaluation metrics (groundedness, relevance, context scores, fallback) to rag_metrics.sqlite after TurnGraph completes."
+            }
+          ]
+        },
+        "infrastructure": {
+          "path": "src/conversation_management/infrastructure",
+          "responsibility": "Implements all outbound ports and repository interfaces. Performs all I/O: database access, LLM calls, scoring.",
+          "artifacts": [
+            {
+              "type": "repository",
+              "name": "InMemoryConversationSessionRepository",
+              "implements": "IConversationSessionRepository",
+              "purpose": "In-memory dict store for active session state. Scoped to process lifetime."
+            },
+            {
+              "type": "repository",
+              "name": "SQLiteConversationHistoryRepository",
+              "implements": "IConversationHistoryRepository",
+              "purpose": "SQLite adapter for Conversation_History table. Primary history store."
+            },
+            {
+              "type": "repository",
+              "name": "InMemoryConversationHistoryRepository",
+              "implements": "IConversationHistoryRepository",
+              "purpose": "In-memory variant of ConversationHistoryRepository \u2014 dev/test only."
+            },
+            {
+              "type": "repository",
+              "name": "SQLiteUserRepository",
+              "implements": "IUserRepository",
+              "purpose": "SQLite adapter for reading User identity."
+            },
+            {
+              "type": "repository",
+              "name": "SQLiteSchoolRepository",
+              "implements": "ISchoolRepository",
+              "purpose": "SQLite adapter for reading School by user association."
+            },
+            {
+              "type": "repository",
+              "name": "SQLitePurchaseHistoryRepository",
+              "implements": "IPurchaseHistoryRepository",
+              "purpose": "SQLite adapter for reading Purchase_History table. Returns empty result set gracefully if no records exist."
+            },
+            {
+              "type": "adapter",
+              "name": "OpenAIIntentClassifier",
+              "implements": "IIntentClassifier",
+              "purpose": "LLM adapter (gpt-4o-mini) that classifies user message into Intent value. Returns one of the six Intent values."
+            },
+            {
+              "type": "adapter",
+              "name": "OpenAIResponseGenerator",
+              "implements": "IResponseGenerator",
+              "purpose": "LLM adapter (gpt-4o) that generates AssistantResponse grounded in RetrievedEvidence and DecisionContext snapshot."
+            },
+            {
+              "type": "adapter",
+              "name": "OpenAIResponseEvaluator",
+              "implements": "IResponseEvaluator",
+              "purpose": "Scoring adapter (gpt-4o-mini) that computes groundedness_score and relevance_score. Enforces score thresholds before response is cleared for delivery."
+            },
+            {
+              "type": "adapter",
+              "name": "SQLiteRAGMetricsLogger",
+              "implements": "IRAGMetricsLogger",
+              "purpose": "Persists per-turn RAG evaluation metrics (groundedness, relevance, context scores, fallback) to rag_metrics.sqlite after each TurnGraph execution."
+            }
+          ]
+        }
+      }
+    },
+
+    {
+      "id": "COMP-2",
+      "name": "decision_intelligence",
+      "module_path": "src/decision_intelligence",
+      "layers": {
+        "domain": {
+          "path": "src/decision_intelligence/domain",
+          "responsibility": "Pure domain model for preference accumulation and retrieval query construction. Owns DecisionContext lifecycle and transitions. Enforces INV-DC-*, INV-RQ-*, and monotonic signal accumulation. No framework, no I/O.",
+          "artifacts": [
+            {
+              "type": "process_entity",
+              "name": "DecisionContext",
+              "purpose": "Accumulates PreferenceSignals monotonically across turns. Manages state transitions (empty → partial → ready → enriched). Enforces INV-DC-1 through INV-DC-6: context never regresses, school is always present, signals never removed."
+            },
+            {
+              "type": "entity",
+              "name": "RetrievalQuery",
+              "purpose": "Context-enriched query artifact built from Intent + accumulated DecisionContext. Carries source_target (product_catalog or referral_program_rules). Enforces INV-RQ-1, INV-RQ-2, INV-RQ-3: never constructed from raw message, source_target must match intent routing."
+            },
+            {
+              "type": "value_object",
+              "name": "PreferenceSignal",
+              "purpose": "Single user preference or constraint extracted from one turn. Immutable once created. Examples: kids=picky, budget=sensitive, preference=healthy. Accumulated monotonically into DecisionContext."
+            },
+            {
+              "type": "value_object",
+              "name": "RetrievedEvidence",
+              "purpose": "Content returned from a knowledge source after retrieval. Immutable. Carries context_recall_score and context_precision_score. Quality gates enforced before evidence is passed to Conversation Management."
+            },
+            {
+              "type": "domain_event",
+              "name": "ContextUpdated",
+              "purpose": "Emitted when a new PreferenceSignal is added and DecisionContext state changes."
+            },
+            {
+              "type": "domain_event",
+              "name": "GapDetected",
+              "purpose": "Emitted when gap evaluation finds the context insufficient for recommendation. Triggers clarification signal in Conversation Management."
+            },
+            {
+              "type": "domain_event",
+              "name": "ContextReady",
+              "purpose": "Emitted when DecisionContext transitions to ready state for the first time."
+            },
+            {
+              "type": "repository_interface",
+              "name": "IDecisionContextRepository",
+              "purpose": "Defines persistence contract for DecisionContext per session. Scoped to session lifecycle."
+            }
+          ]
+        },
+        "application": {
+          "path": "src/decision_intelligence/application",
+          "responsibility": "Orchestrates signal extraction, context state evaluation, query construction, retrieval execution, and evidence quality evaluation across a single turn. Coordinates with Knowledge Retrieval via port.",
+          "artifacts": [
+            {
+              "type": "use_case",
+              "name": "ProcessTurnIntelligenceUseCase",
+              "purpose": "Entry point for COMP-2 per turn. Delegates execution to DecisionIntelligenceSubgraph. Returns RetrievedEvidence (or clarification signal) to caller (COMP-1)."
+            },
+            {
+              "type": "use_case",
+              "name": "PreSeedContextUseCase",
+              "purpose": "Called at session init by COMP-1. Creates DecisionContext pre-seeded with school anchor and any available PurchaseHistory signals."
+            },
+            {
+              "type": "langgraph_graph",
+              "name": "DecisionIntelligenceSubgraph",
+              "purpose": "LangGraph subgraph that executes the full decision intelligence pipeline per turn. Replaces the imperative body of ProcessTurnIntelligenceUseCase. Nodes call ports — no domain logic inside nodes.",
+              "nodes": [
+                "extract_signals",
+                "update_decision_context",
+                "evaluate_context_readiness",
+                "construct_retrieval_query",
+                "execute_retrieval",
+                "evaluate_evidence_quality"
+              ],
+              "conditional_edges": [
+                "evaluate_context_readiness → gap_detected → emit clarification_needed",
+                "evaluate_context_readiness → intent_sufficient_retrieval (referral_question) → construct_retrieval_query (bypass context readiness gate)",
+                "evaluate_context_readiness → ready → construct_retrieval_query",
+                "evaluate_evidence_quality → recall_below_threshold → execute_retrieval (retry with refined query)",
+                "evaluate_evidence_quality → quality_passes → return RetrievedEvidence"
+              ]
+            },
+            {
+              "type": "langgraph_state",
+              "name": "DecisionGraphState",
+              "purpose": "Typed state schema flowing through DecisionIntelligenceSubgraph. Carries only turn-scoped primitives. Fields: session_id, intent, message, signals, context_state, retrieval_query_text, source_target, evidence_chunks, recall_score, precision_score, clarification_needed."
+            },
+            {
+              "type": "port",
+              "name": "ISignalExtractor",
+              "purpose": "Outbound port. Contract for extracting PreferenceSignals from a user message turn using LLM. Implemented in infrastructure."
+            },
+            {
+              "type": "port",
+              "name": "IEvidenceEvaluator",
+              "purpose": "Outbound port. Contract for computing context_recall_score and context_precision_score on RetrievedEvidence. Enforces INV-RE-1, INV-RE-2. If recall < threshold, signals query refinement."
+            },
+            {
+              "type": "port",
+              "name": "IKnowledgeRetrievalService",
+              "purpose": "Outbound port to COMP-3. Contract for executing semantic retrieval given a RetrievalQuery. Returns RetrievedEvidence."
+            }
+          ]
+        },
+        "infrastructure": {
+          "path": "src/decision_intelligence/infrastructure",
+          "responsibility": "Implements all outbound ports and repository interfaces. Performs LLM calls for signal extraction and scoring. Persists DecisionContext.",
+          "artifacts": [
+            {
+              "type": "repository",
+              "name": "InMemoryDecisionContextRepository",
+              "implements": "IDecisionContextRepository",
+              "purpose": "In-session store for DecisionContext. Scoped to the active session. The LangGraph checkpointer (wired in shell/composition) can optionally persist full graph state — including DecisionContext snapshot — across sessions, resolving the prior cross-session continuity gap."
+            },
+            {
+              "type": "adapter",
+              "name": "LLMSignalExtractor",
+              "implements": "ISignalExtractor",
+              "purpose": "LLM adapter that extracts PreferenceSignal values from a user message turn."
+            },
+            {
+              "type": "adapter",
+              "name": "LLMEvidenceEvaluator",
+              "implements": "IEvidenceEvaluator",
+              "purpose": "Scoring adapter that computes context_recall_score and context_precision_score on RetrievedEvidence before evidence is passed to response generation."
+            }
+          ]
+        }
+      }
+    },
+
+    {
+      "id": "COMP-3",
+      "name": "knowledge_retrieval",
+      "module_path": "src/knowledge_retrieval",
+      "layers": {
+        "domain": {
+          "path": "src/knowledge_retrieval/domain",
+          "responsibility": "Domain model for the two knowledge sources: product catalog and referral program rules. Defines retrieval contracts. Enforces the invariant that retrieved content is never invented or rewritten — only returned as-is from the knowledge source.",
+          "artifacts": [
+            {
+              "type": "entity",
+              "name": "Product",
+              "purpose": "A purchasable catalog item. Retrieved by semantic relevance. Never invented by the LLM. Carries identity, name, category, brand, and relevant attributes."
+            },
+            {
+              "type": "entity",
+              "name": "ReferralRule",
+              "purpose": "A platform-defined referral eligibility or reward rule. Immutable. Retrieved by semantic relevance. Never rewritten by the LLM."
+            },
+            {
+              "type": "value_object",
+              "name": "RetrievedEvidence",
+              "purpose": "The retrieval result returned to Decision Intelligence. Typed as product_evidence or referral_rule_evidence. Immutable artifact of the retrieval execution."
+            },
+            {
+              "type": "repository_interface",
+              "name": "IProductRepository",
+              "purpose": "Defines semantic retrieval contract for the product catalog. Takes a query, returns top-matching Product evidence."
+            },
+            {
+              "type": "repository_interface",
+              "name": "IReferralRuleRepository",
+              "purpose": "Defines semantic retrieval contract for referral program rules. Takes a query, returns top-matching ReferralRule evidence."
+            }
+          ]
+        },
+        "application": {
+          "path": "src/knowledge_retrieval/application",
+          "responsibility": "Executes retrieval routing. Receives a RetrievalQuery, routes to the correct source based on source_target, and returns RetrievedEvidence.",
+          "artifacts": [
+            {
+              "type": "use_case",
+              "name": "ExecuteRetrievalUseCase",
+              "purpose": "Routes RetrievalQuery to the correct repository based on source_target (product_catalog → IProductRepository; referral_program_rules → IReferralRuleRepository). Returns RetrievedEvidence to COMP-2."
+            }
+          ]
+        },
+        "infrastructure": {
+          "path": "src/knowledge_retrieval/infrastructure",
+          "responsibility": "Implements semantic retrieval against a vector store for both knowledge sources.",
+          "artifacts": [
+            {
+              "type": "adapter",
+              "name": "QdrantProductRepository",
+              "implements": "IProductRepository",
+              "purpose": "Qdrant vector store adapter for semantic search against the product_catalog collection. Returns top-matching Product evidence."
+            },
+            {
+              "type": "adapter",
+              "name": "QdrantReferralRuleRepository",
+              "implements": "IReferralRuleRepository",
+              "purpose": "Qdrant vector store adapter for semantic search against the referral_program_rules collection. Returns top-matching ReferralRule evidence."
+            }
+          ]
+        }
+      }
+    },
+
+    {
+      "id": "COMP-4",
+      "name": "shell",
+      "module_path": "src/shell",
+      "note": "Shell is not a domain component. It does not have DDD layers. It is the system entry point and the composition root.",
+      "layers": {
+        "api": {
+          "path": "src/shell/api",
+          "responsibility": "REST API entry point. Receives inbound HTTP requests, validates input shape, calls COMP-1 use cases, and returns structured HTTP responses. Owns no domain logic.",
+          "artifacts": [
+            {
+              "type": "schemas",
+              "name": "StartSessionRequest, ProcessTurnRequest, CloseSessionRequest",
+              "purpose": "Inbound Pydantic schemas. StartSessionRequest: user_id. ProcessTurnRequest: user_id, message. CloseSessionRequest: user_id."
+            },
+            {
+              "type": "schemas",
+              "name": "StartSessionResponse, ProcessTurnResponse, CloseSessionResponse, ErrorResponse",
+              "purpose": "Outbound Pydantic schemas. ProcessTurnResponse carries: session_id, response_text, intent, is_fallback, groundedness_score, context_precision_score, context_recall_score, relevance_score."
+            },
+            {
+              "type": "router",
+              "name": "build_router()",
+              "purpose": "Factory function that creates the FastAPI APIRouter with three endpoints: POST /sessions, POST /sessions/{session_id}/turns, DELETE /sessions/{session_id}."
+            },
+            {
+              "type": "app_factory",
+              "name": "create_app()",
+              "purpose": "FastAPI application factory. Calls build_container(), instantiates the router, and registers it on the app. Returns a fully configured FastAPI instance."
+            }
+          ]
+        },
+        "composition": {
+          "path": "src/shell/composition",
+          "responsibility": "Composition root. Wires all components: instantiates repositories, adapters, use cases, and injects dependencies. This is the only place in the system that imports from multiple components simultaneously.",
+          "artifacts": [
+            {
+              "type": "composition_root",
+              "name": "build_container()",
+              "purpose": "Factory function in container.py. The only place that imports from all components simultaneously. Instantiates repositories, adapters, and use cases. Binds ports to implementations. Returns a fully wired AppContainer."
+            }
+          ]
+        }
+      }
+    }
+  ],
+
+  "layer_dependency_summary": {
+    "rule": "Dependencies always point inward",
+    "direction": [
+      "infrastructure → application → domain",
+      "shell/api → application (use cases)",
+      "shell/composition → all layers (wiring only)"
+    ],
+    "domain_depends_on": "nothing",
+    "application_depends_on": "domain only (via interfaces)",
+    "infrastructure_depends_on": "domain (repository interfaces) + application (ports)",
+    "shell_api_depends_on": "application use cases only",
+    "cross_component_dependency": "COMP-1 application calls COMP-2 application via IDecisionIntelligenceService port. COMP-2 application calls COMP-3 application via IKnowledgeRetrievalService port. These are application-layer port contracts — no domain object from one component is imported into another component's domain layer."
+  },
+
+  "folder_structure": {
+    "root": "src/",
+    "tree": [
+      "src/conversation_management/",
+      "src/conversation_management/domain/",
+      "src/conversation_management/application/",
+      "src/conversation_management/infrastructure/",
+      "src/decision_intelligence/",
+      "src/decision_intelligence/domain/",
+      "src/decision_intelligence/application/",
+      "src/decision_intelligence/infrastructure/",
+      "src/knowledge_retrieval/",
+      "src/knowledge_retrieval/domain/",
+      "src/knowledge_retrieval/application/",
+      "src/knowledge_retrieval/infrastructure/",
+      "src/shell/",
+      "src/shell/api/",
+      "src/shell/composition/",
+      "src/ingestion/",
+      "src/ingestion/domain/",
+      "src/ingestion/application/",
+      "src/ingestion/infrastructure/",
+      "src/ingestion/infrastructure/sources/",
+      "src/ingestion/infrastructure/transformers/",
+      "src/ingestion/infrastructure/vector_store/"
+    ]
+  },
+
+  "ingestion_component": {
+    "id": "COMP-5",
+    "name": "knowledge_ingestion",
+    "module_path": "src/ingestion",
+    "deployment": "offline CLI — run before system startup, not part of the runtime container",
+    "note": "COMP-5 follows the same Clean Architecture dependency rule (infrastructure → application → domain) but is fully isolated from all runtime components. It has its own composition root and is never imported by COMP-1 through COMP-4.",
+    "layers": {
+      "domain": {
+        "path": "src/ingestion/domain",
+        "responsibility": "Defines the data contracts for the ingestion pipeline. No business invariants — ingestion is a pure data transformation process. Owns the port interfaces that decouple the pipeline stages.",
+        "artifacts": [
+          {
+            "type": "model",
+            "name": "RawRecord",
+            "purpose": "A raw record loaded from a knowledge source (one product row or one PDF document) before any transformation."
+          },
+          {
+            "type": "model",
+            "name": "IngestionDocument",
+            "purpose": "A semantically labeled, embedding-ready document to be written to the vector store. Carries text, metadata, and a stable ID."
+          },
+          {
+            "type": "model",
+            "name": "IngestionReport",
+            "purpose": "Summary produced at the end of each pipeline execution: collection name, documents written, and any per-record errors."
+          },
+          {
+            "type": "port",
+            "name": "IKnowledgeSource",
+            "purpose": "Outbound port. Contract for loading raw records from any knowledge source (SQLite, PDF directory, etc.)."
+          },
+          {
+            "type": "port",
+            "name": "IDocumentTransformer",
+            "purpose": "Outbound port. Contract for transforming a raw record into one or more semantically labeled IngestionDocuments."
+          },
+          {
+            "type": "port",
+            "name": "IVectorStoreWriter",
+            "purpose": "Outbound port. Contract for writing a batch of IngestionDocuments to a named collection in the vector store."
+          }
+        ]
+      },
+      "application": {
+        "path": "src/ingestion/application",
+        "responsibility": "Orchestrates each ingestion pipeline: load → transform → write. Each use case runs exactly one pipeline end-to-end and returns an IngestionReport.",
+        "artifacts": [
+          {
+            "type": "use_case",
+            "name": "IngestProductCatalogUseCase",
+            "purpose": "Reads all product rows from the SQLite source, enriches each one via the transformer, clears the product_catalog collection, and writes the enriched documents."
+          },
+          {
+            "type": "use_case",
+            "name": "IngestReferralRulesUseCase",
+            "purpose": "Reads all PDF documents from the referral source, splits each into self-contained semantic chunks via the transformer, clears the referral_program_rules collection, and writes the chunks."
+          }
+        ]
+      },
+      "infrastructure": {
+        "path": "src/ingestion/infrastructure",
+        "responsibility": "Implements all ports. Handles all I/O: SQLite queries, PDF text extraction, LLM enrichment calls, embedding generation, and ChromaDB writes.",
+        "artifacts": [
+          {
+            "type": "adapter",
+            "name": "SQLiteProductSource",
+            "implements": "IKnowledgeSource",
+            "purpose": "Reads the products table from the SQLite database. Returns one RawRecord per product row."
+          },
+          {
+            "type": "adapter",
+            "name": "PDFReferralSource",
+            "implements": "IKnowledgeSource",
+            "purpose": "Reads all PDF files from the docs directory using pdfplumber. Returns one RawRecord per PDF with the full extracted text."
+          },
+          {
+            "type": "adapter",
+            "name": "ProductSemanticBuilder",
+            "implements": "IDocumentTransformer",
+            "purpose": "Calls an LLM to enrich each product row with inferred semantic labels (category, meal occasion, dietary profile, budget tier). One product row → one enriched IngestionDocument."
+          },
+          {
+            "type": "adapter",
+            "name": "ReferralSemanticBuilder",
+            "implements": "IDocumentTransformer",
+            "purpose": "Calls an LLM to split PDF text into self-contained semantic chunks (rules, FAQ entries, policy sections). One PDF → N IngestionDocuments. Splitting is by meaning, not by character count. Includes a paragraph-split fallback if JSON parsing fails."
+          },
+          {
+            "type": "adapter",
+            "name": "ChromaVectorStoreWriter",
+            "implements": "IVectorStoreWriter",
+            "purpose": "Embeds documents using the OpenAI embeddings API (text-embedding-3-small) and writes them to a ChromaDB persistent store. Processes embeddings in safe batch sizes. Implements clear_collection for idempotent re-ingestion."
+          }
+        ]
+      },
+      "composition_root": {
+        "path": "src/ingestion/run_ingestion.py",
+        "responsibility": "Wires all ports to their adapters, instantiates both use cases, and runs both pipelines sequentially. The only place in COMP-5 that knows about all infrastructure components.",
+        "entry_point": "python -m src.ingestion (from project root)"
+      }
+    }
+  }
+}

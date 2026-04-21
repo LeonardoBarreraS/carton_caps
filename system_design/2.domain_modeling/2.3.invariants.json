@@ -1,0 +1,245 @@
+{
+  "system": "Carton Caps Conversational Assistant",
+  "version": "1.0",
+  "derived_from": [
+    "process_entities.json",
+    "domain_concepts.json",
+    "system_workflows.json",
+    "functional_requirements.json"
+  ],
+  "invariants": [
+    {
+      "id": "INV-CS-1",
+      "entity": "ConversationSession",
+      "type": "state",
+      "rule": "Session status must be one of: created, initializing, active, idle, closed"
+    },
+    {
+      "id": "INV-CS-2",
+      "entity": "ConversationSession",
+      "type": "transition",
+      "rule": "A session cannot enter active state before initialization is complete",
+      "allowed_transitions": [
+        "created → initializing",
+        "initializing → idle",
+        "idle → active",
+        "active → idle  [via complete_turn() on success]",
+        "active → idle  [via fail_turn() on error — rollback, no event emitted]",
+        "idle → closed"
+      ],
+      "illegal_transitions": [
+        "created → active",
+        "closed → any",
+        "active → closed",
+        "any → initializing"
+      ]
+    },
+    {
+      "id": "INV-CS-3",
+      "entity": "ConversationSession",
+      "type": "dependency",
+      "rule": "The user's school must be resolved and pre-seeded into DecisionContext during initializing, before the first turn begins"
+    },
+    {
+      "id": "INV-CS-4",
+      "entity": "ConversationSession",
+      "type": "dependency",
+      "rule": "A turn cannot be processed while the session is in initializing state"
+    },
+    {
+      "id": "INV-CS-5",
+      "entity": "ConversationSession",
+      "type": "consistency",
+      "rule": "Every session in active state must have exactly one associated DecisionContext"
+    },
+    {
+      "id": "INV-CS-6",
+      "entity": "ConversationSession",
+      "type": "consistency",
+      "rule": "Every request must carry a pre-resolved, trusted user_id. The service never handles authentication."
+    },
+    {
+      "id": "INV-CS-7",
+      "entity": "ConversationSession",
+      "type": "consistency",
+      "rule": "A user cannot have more than one session in active or idle state simultaneously"
+    },
+    {
+      "id": "INV-DC-1",
+      "entity": "DecisionContext",
+      "type": "state",
+      "rule": "Status must be one of: empty, partial, ready, enriched"
+    },
+    {
+      "id": "INV-DC-2",
+      "entity": "DecisionContext",
+      "type": "state",
+      "rule": "The school field must always be present — it is never null or missing. Set at session initialization and never changes."
+    },
+    {
+      "id": "INV-DC-3",
+      "entity": "DecisionContext",
+      "type": "transition",
+      "rule": "Context never regresses once ready or enriched",
+      "allowed_transitions": [
+        "empty → partial",
+        "partial → partial",
+        "partial → ready",
+        "ready → enriched",
+        "enriched → enriched"
+      ],
+      "illegal_transitions": [
+        "ready → partial",
+        "ready → empty",
+        "enriched → ready",
+        "enriched → partial",
+        "enriched → empty",
+        "empty → ready"
+      ]
+    },
+    {
+      "id": "INV-DC-4",
+      "entity": "DecisionContext",
+      "type": "dependency",
+      "rule": "Product retrieval (WF2) cannot activate unless intent is product_inquiry OR DecisionContext is ready or enriched"
+    },
+    {
+      "id": "INV-DC-5",
+      "entity": "DecisionContext",
+      "type": "consistency",
+      "rule": "Preference signals accumulate monotonically — once added, a signal is never removed"
+    },
+    {
+      "id": "INV-DC-6",
+      "entity": "DecisionContext",
+      "type": "consistency",
+      "rule": "A context in ready or enriched state must have at least one PreferenceSignal beyond the pre-seeded school"
+    },
+    {
+      "id": "INV-PRI-1",
+      "entity": "DecisionContext",
+      "type": "consistency",
+      "rule": "pending_retrieval_intent must only be set to a value from the retrieval intents set (product_inquiry, referral_question). It must never be set to general_question, clarification_response, ambiguous, or out_of_scope."
+    },
+    {
+      "id": "INV-PRI-2",
+      "entity": "DecisionContext",
+      "type": "consistency",
+      "rule": "pending_retrieval_intent must be cleared atomically when retrieval is successfully resumed. It must not persist across a completed retrieval turn."
+    },
+    {
+      "id": "INV-RQ-1",
+      "entity": "RetrievalQuery",
+      "type": "consistency",
+      "rule": "A retrieval query must always be constructed from intent + accumulated DecisionContext — never from the raw user message alone"
+    },
+    {
+      "id": "INV-RQ-2",
+      "entity": "RetrievalQuery",
+      "type": "consistency",
+      "rule": "source_target must be one of: product_catalog, referral_program_rules"
+    },
+    {
+      "id": "INV-RQ-3",
+      "entity": "RetrievalQuery",
+      "type": "consistency",
+      "rule": "source_target must match intent routing: product_inquiry → product_catalog; referral_question → referral_program_rules"
+    },
+    {
+      "id": "INV-AR-1",
+      "entity": "AssistantResponse",
+      "type": "consistency",
+      "rule": "Every response must be grounded in retrieved evidence. groundedness_score must meet the minimum threshold (e.g., >= 0.8) before the response is returned to the caller. Pure LLM-generated responses without retrieval are not permitted."
+    },
+    {
+      "id": "INV-AR-2",
+      "entity": "AssistantResponse",
+      "type": "consistency",
+      "rule": "Product recommendations must cite only products returned by the retrieval step — the LLM cannot invent products"
+    },
+    {
+      "id": "INV-AR-3",
+      "entity": "AssistantResponse",
+      "type": "consistency",
+      "rule": "Referral guidance must be derived exclusively from retrieved referral rules — not from LLM memory"
+    },
+    {
+      "id": "INV-AR-4",
+      "entity": "AssistantResponse",
+      "type": "consistency",
+      "rule": "Every product recommendation must explicitly reference the user's school fundraising goal"
+    },
+    {
+      "id": "INV-AR-5",
+      "entity": "AssistantResponse",
+      "type": "consistency",
+      "rule": "If groundedness_score or relevance_score falls below the minimum threshold, the response must not be returned to the caller. A safe fallback message is delivered instead."
+    },
+    {
+      "id": "INV-AR-6",
+      "entity": "AssistantResponse",
+      "type": "consistency",
+      "rule": "relevance_score measures intent alignment using the reverse-question technique. A response that is grounded but answers the wrong question is still a failure and must be treated as a threshold breach."
+    },
+    {
+      "id": "INV-RE-1",
+      "entity": "RetrievedEvidence",
+      "type": "consistency",
+      "rule": "context_recall_score must be computed after every retrieval call, before evidence is injected into generation"
+    },
+    {
+      "id": "INV-RE-2",
+      "entity": "RetrievedEvidence",
+      "type": "consistency",
+      "rule": "context_precision_score must be computed after every retrieval call, before evidence is injected into generation"
+    },
+    {
+      "id": "INV-RE-3",
+      "entity": "RetrievedEvidence",
+      "type": "consistency",
+      "rule": "If context_recall_score falls below the minimum threshold, the retrieval query must be refined and retrieval retried. Evidence with degraded recall must not proceed to generation."
+    },
+    {
+      "id": "INV-RE-4",
+      "entity": "RetrievedEvidence",
+      "type": "consistency",
+      "rule": "Evidence must not be injected into generation if context quality scores indicate the retrieval failed to return the required knowledge"
+    },
+    {
+      "id": "INV-WF-1",
+      "entity": "Workflow",
+      "type": "dependency",
+      "rule": "Within every turn: intent must be classified before DecisionContext is updated"
+    },
+    {
+      "id": "INV-WF-2",
+      "entity": "Workflow",
+      "type": "dependency",
+      "rule": "Within every turn: DecisionContext must be updated before a RetrievalQuery is constructed"
+    },
+    {
+      "id": "INV-WF-3",
+      "entity": "Workflow",
+      "type": "dependency",
+      "rule": "Within every turn: retrieval must complete before response generation begins"
+    },
+    {
+      "id": "INV-WF-5",
+      "entity": "Workflow",
+      "type": "dependency",
+      "rule": "Within every turn: context quality (context_recall_score, context_precision_score) must be evaluated after retrieval and before evidence injection"
+    },
+    {
+      "id": "INV-WF-6",
+      "entity": "Workflow",
+      "type": "dependency",
+      "rule": "Within every turn: groundedness_score and relevance_score must be evaluated after generation and before the response is returned to the caller"
+    },
+    {
+      "id": "INV-WF-4",
+      "entity": "Workflow",
+      "type": "dependency",
+      "rule": "WF1 (Decision Context Building) must execute on every turn — it cannot be skipped or bypassed"
+    }
+  ]
+}

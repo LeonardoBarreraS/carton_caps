@@ -1,0 +1,537 @@
+{
+  "system": "Carton Caps Conversational Assistant",
+  "version": "1.0",
+  "phase": "5 — Application Layer Design",
+  "task": "Use Case Generator",
+  "derived_from": [
+    "system_workflows.json",
+    "domain_model.json",
+    "process_entities.json",
+    "components.json",
+    "context_communication.json",
+    "layered_architecture.json"
+  ],
+  "design_principles": [
+    "Each use case is one atomic system action — one transaction boundary",
+    "Use cases orchestrate domain behavior — they never implement domain rules or invariants directly",
+    "Use cases load domain objects, invoke behavioral methods, persist results, drain events, return response",
+    "Cross-context calls go exclusively through ports defined in the caller's application layer",
+    "No domain object from one bounded context is passed into another — only primitive DTOs cross boundaries",
+    "LangGraph graphs (TurnGraph, DecisionIntelligenceSubgraph) are the execution engines wired inside their parent use case — the use case is the entry point and transaction owner; the graph is materialized in Task 2 (Workflow Orchestration)",
+    "Commands carry only the data needed to execute — no domain objects, no infrastructure references"
+  ],
+
+  "use_cases": [
+
+    {
+      "id": "UC-1",
+      "name": "StartSessionUseCase",
+      "component": "COMP-1",
+      "bounded_context": "BC-1",
+      "bounded_context_name": "conversation_management",
+      "module_path": "src/conversation_management/application/use_cases/start_session_use_case.py",
+      "trigger_workflow": "WF0 — session initialization sequence (pre-turn)",
+      "purpose": "Creates and fully initializes a ConversationSession for a user. Enforces one-session-per-user constraint. Loads all identity and history data from DB. Pre-seeds DecisionContext in COMP-2 via port. Transitions session to idle state ready for the first turn.",
+
+      "input_command": {
+        "name": "StartSessionCommand",
+        "location": "src/conversation_management/application/use_cases/start_session_use_case.py",
+        "fields": [
+          { "name": "user_id", "type": "str", "note": "Pre-resolved trusted user identity. Never authenticated here." }
+        ]
+      },
+
+      "output_response": {
+        "name": "StartSessionResponse",
+        "location": "src/conversation_management/application/use_cases/start_session_use_case.py",
+        "fields": [
+          { "name": "session_id", "type": "str" },
+          { "name": "status",     "type": "str", "note": "idle" }
+        ]
+      },
+
+      "dependencies": [
+        { "interface": "IUserRepository",                "role": "load User by user_id" },
+        { "interface": "ISchoolRepository",              "role": "load School by user_id" },
+        { "interface": "IConversationHistoryRepository", "role": "load prior ConversationHistory by user_id" },
+        { "interface": "IPurchaseHistoryRepository",     "role": "load PurchaseHistory by user_id (optional — empty list if none)" },
+        { "interface": "IConversationSessionRepository", "role": "find_active_by_user_id (INV-CS-7 guard), save session" },
+        { "interface": "IDecisionIntelligenceService",   "role": "pre_seed_context: sends PreSeedContextDTO to COMP-2" }
+      ],
+
+      "execution_flow": [
+        "1. Validate user_id is not empty",
+        "2. Call IConversationSessionRepository.find_active_by_user_id(user_id) — if active or idle session already exists, raise ConflictError (enforces INV-CS-7)",
+        "3. Call IUserRepository.find_by_id(user_id) — raise NotFoundError if user does not exist (enforces INV-CS-6)",
+        "4. Call ISchoolRepository.find_by_user_id(user_id) — raise NotFoundError if school not found (enforces INV-CS-3)",
+        "5. Call IConversationHistoryRepository.find_by_user_id(user_id) — returns empty list gracefully if no history",
+        "6. Call IPurchaseHistoryRepository.find_by_user_id(user_id) — returns empty list gracefully if no records",
+        "7. Call ConversationSession.create(user_id, school_id) — session enters created state",
+        "8. Call session.begin_initialization() — session transitions created → initializing",
+        "9. Build PreSeedContextDTO(session_id, school_id, school_name, purchase_signals) from loaded data",
+        "10. Call IDecisionIntelligenceService.pre_seed_context(PreSeedContextDTO) — COMP-2 creates DecisionContext with school anchor (enforces INV-CS-3, INV-CS-5)",
+        "11. Call session.complete_initialization() — session transitions initializing → idle; emits SessionStarted",
+        "12. Call IConversationSessionRepository.save(session)",
+        "13. Drain domain events (SessionStarted — consumed by observability handlers)",
+        "14. Return StartSessionResponse(session_id, status='idle')"
+      ],
+
+      "invariants_enforced": [
+        "INV-CS-3 — school pre-seeded into DecisionContext before session becomes active",
+        "INV-CS-5 — DecisionContext exists before session enters active state",
+        "INV-CS-6 — user_id is pre-resolved; raise if user not found",
+        "INV-CS-7 — one active/idle session per user; reject if already exists"
+      ],
+
+      "cross_context_calls": [
+        {
+          "port": "IDecisionIntelligenceService.pre_seed_context",
+          "dto_out": "PreSeedContextDTO",
+          "dto_in": "void",
+          "delegates_to": "PreSeedContextUseCase (COMP-2) via DecisionIntelligenceAdapter (shell)"
+        }
+      ],
+
+      "notes": "ConversationHistory is loaded here to pass as context to the pre-seeding step if needed. PurchaseHistory signals are forwarded to COMP-2 as raw strings — no domain object crosses the boundary."
+    },
+
+    {
+      "id": "UC-2",
+      "name": "ProcessTurnUseCase",
+      "component": "COMP-1",
+      "bounded_context": "BC-1",
+      "bounded_context_name": "conversation_management",
+      "module_path": "src/conversation_management/application/use_cases/process_turn_use_case.py",
+      "trigger_workflow": "WF0 — per-turn execution (classifies intent, retrieves evidence, generates and evaluates response)",
+      "purpose": "Entry point for every conversation turn. Guards session state. Initializes and runs TurnGraph (LangGraph execution engine). TurnGraph orchestrates intent classification, decision intelligence delegation, response generation, and response evaluation. Persists the completed turn. Returns the validated AssistantResponse to the API layer.",
+
+      "input_command": {
+        "name": "ProcessTurnCommand",
+        "location": "src/conversation_management/application/use_cases/process_turn_use_case.py",
+        "fields": [
+          { "name": "session_id", "type": "str" },
+          { "name": "user_id",    "type": "str", "note": "Passed through for TurnGraph state initialization and history persistence" },
+          { "name": "message",    "type": "str", "note": "Raw user message text" }
+        ]
+      },
+
+      "output_response": {
+        "name": "ProcessTurnResponse",
+        "location": "src/conversation_management/application/use_cases/process_turn_use_case.py",
+        "fields": [
+          { "name": "session_id",              "type": "str" },
+          { "name": "response_text",           "type": "str" },
+          { "name": "intent",                  "type": "str" },
+          { "name": "is_fallback",             "type": "bool" },
+          { "name": "groundedness_score",      "type": "float" },
+          { "name": "context_precision_score", "type": "float", "note": "0.0 if no retrieval occurred" },
+          { "name": "context_recall_score",    "type": "float", "note": "0.0 if no retrieval occurred" },
+          { "name": "relevance_score",         "type": "float" }
+        ]
+      },
+
+      "dependencies": [
+        { "interface": "IConversationSessionRepository", "role": "load session, save session after turn completes" },
+        { "interface": "IConversationHistoryRepository", "role": "load full ConversationHistory before graph invocation (to populate conversation_history: list[dict]); append user message and assistant response entries after turn" },
+        { "interface": "IUserRepository",               "role": "load User.name as user_name before TurnGraph invocation for LLM personalization" },
+        { "interface": "ISchoolRepository",             "role": "load School.name as school_name before TurnGraph invocation for LLM personalization" },
+        { "interface": "IIntentClassifier",             "role": "classify Intent from user message (TurnGraph node)" },
+        { "interface": "IDecisionIntelligenceService",  "role": "process_turn: sends TurnInputDTO, receives TurnIntelligenceResultDTO (TurnGraph node)" },
+        { "interface": "IResponseGenerator",            "role": "generate AssistantResponse grounded in retrieved evidence (TurnGraph node)" },
+        { "interface": "IResponseEvaluator",            "role": "evaluate groundedness_score and relevance_score on response (TurnGraph node)" },
+        { "interface": "IRAGMetricsLogger",              "role": "persist per-turn RAG evaluation metrics after TurnGraph completes" }
+      ],
+
+      "execution_flow": [
+        "1. Call IConversationSessionRepository.find_by_id(session_id) — raise NotFoundError if not found",
+        "2. Guard: session must be in idle state; raise InvalidStateError if in initializing, created, or closed state (enforces INV-CS-4)",
+        "3. Guard: session.user_id must match command.user_id — raise SessionOwnershipError if mismatch (enforces INV-CS-5)",
+        "4. Load full ConversationHistory via IConversationHistoryRepository.find_by_user_id(user_id). Map to conversation_history: list[dict] with {\"role\": \"user\"|\"assistant\", \"content\": str} pairs (Proposal B — explicit history injection threaded through all LLM calls).",
+        "4a. Call IUserRepository.find_by_id(user_id) — load User.name as user_name (default '' if not found).",
+        "4b. Call ISchoolRepository.find_by_user_id(user_id) — load School.name as school_name (default '' if not found). Both user_name and school_name are injected into TurnGraphState so all LLM response nodes (N3 generate_response, N4 generate_clarification, N8 handle_out_of_scope) can personalise their system prompts via OpenAIResponseGenerator.",
+        "5. Call session.receive_message() — transitions idle → active",
+        "6. Open try block covering steps 7–12:",
+        "7. Build initial TurnGraphState(session_id, user_id, message, turn_number=session.turn_count+1, conversation_history, user_name, school_name)",
+        "8. Run TurnGraph — execution engine for the full turn pipeline (see TurnGraph in Workflow Orchestration task):",
+        "   8a. classify_intent node: calls IIntentClassifier.classify(message, conversation_history) → Intent",
+        "   8b. Conditional routing on intent:",
+        "       - out_of_scope → handle_out_of_scope node (polite scope-redirect; DI and retrieval bypassed; history not persisted)",
+        "       - ambiguous → generate_clarification node",
+        "       - general_question → generate_redirect node (redirect; DI and retrieval bypassed)",
+        "       - product_inquiry / referral_question / clarification_response → process_decision_intelligence node",
+        "   8c. process_decision_intelligence node: calls IDecisionIntelligenceService.process_turn(TurnInputDTO(session_id, intent, message, turn_number, conversation_history)) → TurnIntelligenceResultDTO",
+        "       — if TurnIntelligenceResultDTO.clarification_needed: route to generate_clarification node",
+        "   8d. generate_response node: calls IResponseGenerator.generate(message, evidence, context_snapshot) → AssistantResponse (context_snapshot carries user_name and school_name)",
+        "   8e. route_after_generate_response: general_question → persist_turn (no evidence; Fix 5); RAG intents → evaluate_response node",
+        "   8f. evaluate_response node: calls IResponseEvaluator.evaluate(response, intent, evidence) → ScoredAssistantResponse",
+        "       — scores pass: route to persist_turn node",
+        "       — scores fail: route to return_fallback node → AssistantResponse.fallback()",
+        "   8g. generate_clarification node: routes directly to persist_turn (Fix 4 — no evidence to evaluate)",
+        "9. Call session.complete_turn(intent, response) — transitions active → idle; emits TurnProcessed; increments turn_count",
+        "10. On any exception raised in steps 7–9: call session.fail_turn() — transitions active → idle (rollback, no event emitted); call IConversationSessionRepository.save(session); re-raise the exception so the API layer returns the correct HTTP error.",
+        "11. Append ConversationHistory entries: user message and assistant response",
+        "12. Call IConversationSessionRepository.save(session)",
+        "13. Call IConversationHistoryRepository.append() for both history entries",
+        "14. Drain domain events (TurnProcessed)",
+        "15. Return ProcessTurnResponse from final TurnGraph state"
+      ],
+
+      "invariants_enforced": [
+        "INV-CS-4 — turn rejected if session is not in idle state",
+        "INV-WF-1 — turn is persisted to history after completion",
+        "INV-AR-1 — groundedness_score must reach threshold (enforced inside TurnGraph evaluate_response node)",
+        "INV-AR-5 — response blocked and fallback returned if scores fail (TurnGraph evaluate_response conditional edge)",
+        "INV-AR-6 — relevance_score computed via IResponseEvaluator (reverse-question technique)"
+      ],
+
+      "cross_context_calls": [
+        {
+          "port": "IDecisionIntelligenceService.process_turn",
+          "dto_out": "TurnInputDTO(session_id, intent, message, turn_number, conversation_history)",
+          "dto_in": "TurnIntelligenceResultDTO(evidence_chunks, evidence_type, context_recall_score, context_precision_score, context_state, clarification_needed, clarification_question)",
+          "delegates_to": "ProcessTurnIntelligenceUseCase (COMP-2) via DecisionIntelligenceAdapter (shell)"
+        }
+      ],
+
+      "notes": "The TurnGraph is the execution engine — it is initialized and run here but its node/edge definitions are materialized in the Workflow Orchestration task (Task 2). This use case is the owner of the transaction boundary: it begins with session.receive_message() and closes with session.complete_turn() and persistence."
+    },
+
+    {
+      "id": "UC-3",
+      "name": "CloseSessionUseCase",
+      "component": "COMP-1",
+      "bounded_context": "BC-1",
+      "bounded_context_name": "conversation_management",
+      "module_path": "src/conversation_management/application/use_cases/close_session_use_case.py",
+      "trigger_workflow": "WF0 — session closure (post-conversation)",
+      "purpose": "Transitions a ConversationSession to the closed terminal state. Enforces that only idle sessions can be closed. Persists the final session state.",
+
+      "input_command": {
+        "name": "CloseSessionCommand",
+        "location": "src/conversation_management/application/use_cases/close_session_use_case.py",
+        "fields": [
+          { "name": "session_id", "type": "str" },
+          { "name": "user_id",    "type": "str", "note": "Used to verify session ownership before closing" }
+        ]
+      },
+
+      "output_response": {
+        "name": "CloseSessionResponse",
+        "location": "src/conversation_management/application/use_cases/close_session_use_case.py",
+        "fields": [
+          { "name": "session_id", "type": "str" },
+          { "name": "status",     "type": "str", "note": "closed" }
+        ]
+      },
+
+      "dependencies": [
+        { "interface": "IConversationSessionRepository", "role": "load session, save terminal state" }
+      ],
+
+      "execution_flow": [
+        "1. Call IConversationSessionRepository.find_by_id(session_id) — raise NotFoundError if not found",
+        "2. Guard: session.user_id must match command.user_id — raise AuthorizationError if mismatch",
+        "3. Call session.close() — domain guard enforces status == idle; transitions idle → closed; emits SessionClosed (illegal if session is in active state — enforces INV-CS-2)",
+        "4. Call IConversationSessionRepository.save(session)",
+        "5. Drain domain events (SessionClosed)",
+        "6. Return CloseSessionResponse(session_id, status='closed')"
+      ],
+
+      "invariants_enforced": [
+        "INV-CS-2 — only idle sessions can be closed (active → closed is an illegal transition; domain guard raises DomainError)"
+      ],
+
+      "cross_context_calls": [],
+
+      "notes": "The domain's close() method guard enforces the transition rule. This use case does not need to check status explicitly — it delegates that responsibility to the domain."
+    },
+
+    {
+      "id": "UC-4",
+      "name": "PreSeedContextUseCase",
+      "component": "COMP-2",
+      "bounded_context": "BC-2",
+      "bounded_context_name": "decision_intelligence",
+      "module_path": "src/decision_intelligence/application/use_cases/pre_seed_context_use_case.py",
+      "trigger_workflow": "WF0 — session init sequence, called by COMM-1 (IDecisionIntelligenceService.pre_seed_context)",
+      "purpose": "Creates and pre-seeds a DecisionContext for a new session. Sets the school anchor as the permanent fundraising reference. Optionally converts PurchaseHistory signals into early PreferenceSignals. Called once per session before any turn.",
+
+      "input_command": {
+        "name": "PreSeedContextCommand",
+        "location": "src/decision_intelligence/application/use_cases/pre_seed_context_use_case.py",
+        "fields": [
+          { "name": "session_id",        "type": "str" },
+          { "name": "school_id",         "type": "str" },
+          { "name": "school_name",       "type": "str" },
+          { "name": "purchase_signals",  "type": "list[str]", "note": "Raw purchase signal strings from PurchaseHistory. Empty list if user has no history." }
+        ]
+      },
+
+      "output_response": {
+        "name": "None",
+        "note": "Returns None (void). Called for its side effect of creating and persisting the DecisionContext."
+      },
+
+      "dependencies": [
+        { "interface": "IDecisionContextRepository", "role": "save newly created DecisionContext" }
+      ],
+
+      "execution_flow": [
+        "1. Build SchoolAnchor(school_id, school_name) value object",
+        "2. Call DecisionContext.create(session_id, school_anchor) — context enters empty state with school pre-seeded (enforces INV-DC-2)",
+        "3. If purchase_signals is non-empty: for each raw signal string, create PreferenceSignal(key='purchase_history', value=signal, turn_number=0) and call context.add_signal(signal) — context may transition empty → partial",
+        "4. Call IDecisionContextRepository.save(context)",
+        "5. Return None"
+      ],
+
+      "invariants_enforced": [
+        "INV-DC-2 — school_anchor is always present; DecisionContext.create() raises if null",
+        "INV-CS-3 — school anchor is set before any turn begins (enforced via this use case being called from StartSessionUseCase)"
+      ],
+
+      "cross_context_calls": [],
+
+      "notes": "This use case is invoked indirectly by COMP-1 through IDecisionIntelligenceService.pre_seed_context() → DecisionIntelligenceAdapter (shell) → this use case. COMP-1 never imports this use case directly."
+    },
+
+    {
+      "id": "UC-5",
+      "name": "ProcessTurnIntelligenceUseCase",
+      "component": "COMP-2",
+      "bounded_context": "BC-2",
+      "bounded_context_name": "decision_intelligence",
+      "module_path": "src/decision_intelligence/application/use_cases/process_turn_intelligence_use_case.py",
+      "trigger_workflow": "WF1 (Decision Context Building) + WF2 (Product Recommendation) + WF3 (Referral Guidance) — executed per turn",
+      "purpose": "Entry point for COMP-2 per conversation turn. Initializes and runs DecisionIntelligenceSubgraph (LangGraph execution engine). The subgraph extracts preference signals, updates DecisionContext, evaluates context readiness, constructs the retrieval query, executes retrieval via COMP-3 port, and evaluates evidence quality. Returns TurnIntelligenceResultDTO to COMP-1 (including clarification signal if gaps are detected).",
+
+      "input_command": {
+        "name": "ProcessTurnIntelligenceCommand",
+        "location": "src/decision_intelligence/application/use_cases/process_turn_intelligence_use_case.py",
+        "fields": [
+          { "name": "session_id",    "type": "str" },
+          { "name": "intent",        "type": "str", "note": "Intent value as string — not as BC-1 domain object" },
+          { "name": "message",       "type": "str", "note": "Raw user message text" },
+          { "name": "turn_number",   "type": "int", "note": "Current turn count from ConversationSession — used for PreferenceSignal timestamping" },
+          { "name": "conversation_history", "type": "list[dict]", "note": "Full conversation history as OpenAI-format messages [{\"role\": \"user\"|\"assistant\", \"content\": str}]. Loaded once in ProcessTurnUseCase and threaded through all LLM calls so every model sees full conversational context." }
+        ]
+      },
+
+      "output_response": {
+        "name": "TurnIntelligenceResult",
+        "location": "src/decision_intelligence/application/use_cases/process_turn_intelligence_use_case.py",
+        "note": "Mapped to TurnIntelligenceResultDTO by DecisionIntelligenceAdapter (shell) before reaching COMP-1",
+        "fields": [
+          { "name": "evidence_chunks",           "type": "list[str]",   "note": "Retrieved content text chunks. Empty if clarification needed." },
+          { "name": "evidence_type",             "type": "str",         "note": "product_evidence | referral_rule_evidence | none" },
+          { "name": "context_recall_score",      "type": "float",       "note": "0.0 if no retrieval occurred" },
+          { "name": "context_precision_score",   "type": "float",       "note": "0.0 if no retrieval occurred" },
+          { "name": "context_state",             "type": "str",         "note": "Current DecisionContext state: empty|partial|ready|enriched" },
+          { "name": "clarification_needed",      "type": "bool" },
+          { "name": "clarification_question",    "type": "str | None",  "note": "Suggested clarification question if gaps detected" },
+          { "name": "school_name",               "type": "str",         "note": "Forwarded from SchoolAnchor for LLM personalization in BC-1. Default empty string." }
+        ]
+      },
+
+      "dependencies": [
+        { "interface": "IDecisionContextRepository", "role": "load DecisionContext by session_id, save after update" },
+        { "interface": "ISignalExtractor",           "role": "extract PreferenceSignals from message (subgraph node)" },
+        { "interface": "IEvidenceEvaluator",         "role": "compute context_recall_score and context_precision_score on retrieved evidence (subgraph node)" },
+        { "interface": "IKnowledgeRetrievalService", "role": "retrieve evidence from COMP-3 via RetrievalQueryDTO (subgraph node)" }
+      ],
+
+      "execution_flow": [
+        "1. Call IDecisionContextRepository.find_by_session_id(session_id) — raise NotFoundError if context not found (context must have been pre-seeded)",
+        "2. Build initial DecisionGraphState(session_id, intent, message, turn_number, conversation_history, context_snapshot=context.snapshot())",
+        "3. Run DecisionIntelligenceSubgraph — execution engine for the full decision pipeline (see DecisionIntelligenceSubgraph in Workflow Orchestration task):",
+        "   3a. extract_signals node: calls ISignalExtractor.extract(message, turn_number, conversation_history) → list[PreferenceSignal] (full conversation history provides context for interpreting all user messages including clarification answers)",
+        "   3b. update_decision_context node: calls context.add_signal() for each extracted signal; transitions context state if thresholds met",
+        "   3c. evaluate_context_readiness node: calls context.record_gap_evaluation(gaps); if gaps non-empty → emits GapDetected; calls context.mark_ready() if context is sufficient",
+        "   3d. Conditional routing on context readiness:",
+        "       - intent == 'clarification_response' AND context.pending_retrieval_intent is set AND gaps resolved → override state intent to pending_retrieval_intent, clear_pending_retrieval_intent(), route to construct_retrieval_query (Fix 2 — resume original retrieval flow)",
+        "       - intent == 'clarification_response' AND context.pending_retrieval_intent is set AND gaps remain → set clarification_needed=True, build new clarification question, skip retrieval (Fix 2 — keep asking)",
+        "       - intent == 'clarification_response' AND context.pending_retrieval_intent is None → no prior paused retrieval, skip to END with empty evidence",
+        "       - has_gap AND retrieval intent → set clarification_needed=True, context.set_pending_retrieval_intent(intent) (Fix 1), skip retrieval",
+        "       - retrieval intent AND context.is_ready_for_retrieval() → proceed to construct_retrieval_query node (enforces INV-DC-4)",
+        "       - intent does not require retrieval (general_question) → skip retrieval entirely",
+        "       3e. construct_retrieval_query node: user message (primary) + signal values (reinforcement) + domain anchor assembled into query_text. For clarification resumes, signal values only. School name excluded. top_k = _BASE_TOP_K + retrieval_attempts * _TOP_K_INCREMENT. Calls RetrievalQuery.from_context(session_id, query_text, intent, context_status) — enforces INV-RQ-1, INV-RQ-2, INV-RQ-3",
+        "   3f. execute_retrieval node: calls IKnowledgeRetrievalService.retrieve(RetrievalQueryDTO) → RetrievedEvidenceDTO",
+        "   3g. evaluate_evidence_quality node: calls IEvidenceEvaluator.evaluate(query, evidence) → ScoredRetrievedEvidence",
+        "       — recall < threshold: refine query and retry execute_retrieval (enforces INV-RE-3)",
+        "       — quality passes: proceed to return evidence (enforces INV-RE-4)",
+        "4. Call IDecisionContextRepository.save(context) — persist updated signals and state",
+        "5. Drain domain events (ContextUpdated, GapDetected, ContextReady — intra-component only)",
+        "6. Return TurnIntelligenceResult from final DecisionGraphState"
+      ],
+
+      "invariants_enforced": [
+        "INV-DC-4 — retrieval only activates when intent requires it AND context is ready or enriched",
+        "INV-DC-5 — signals accumulate monotonically; context.add_signal() never removes (domain-enforced)",
+        "INV-RQ-1 — query_text constructed from context.snapshot(), never from raw message",
+        "INV-RQ-2 — source_target derived from intent (product_inquiry → product_catalog; referral_question → referral_program_rules)",
+        "INV-RQ-3 — source_target validated against intent in RetrievalQuery.from_context() factory",
+        "INV-RE-1 — context_recall_score computed after every retrieval execution",
+        "INV-RE-2 — context_precision_score computed after every retrieval execution",
+        "INV-RE-3 — retrieval retried with refined query if recall falls below threshold",
+        "INV-RE-4 — evidence with failed scores does not exit this use case toward response generation",
+        "INV-WF-2 — WF2 (Product Recommendation) activates only when context is ready/enriched and intent is product_inquiry"
+      ],
+
+      "cross_context_calls": [
+        {
+          "port": "IKnowledgeRetrievalService.retrieve",
+          "dto_out": "RetrievalQueryDTO(query_text, source_target)",
+          "dto_in": "RetrievedEvidenceDTO(chunks, evidence_type)",
+          "delegates_to": "ExecuteRetrievalUseCase (COMP-3) via KnowledgeRetrievalAdapter (shell)"
+        }
+      ],
+
+      "notes": "The DecisionIntelligenceSubgraph is the execution engine wired inside this use case — its node/edge definitions are materialized in the Workflow Orchestration task (Task 2). This use case owns the transaction boundary: load DecisionContext → run subgraph → persist context → return result."
+    },
+
+    {
+      "id": "UC-6",
+      "name": "ExecuteRetrievalUseCase",
+      "component": "COMP-3",
+      "bounded_context": "BC-3",
+      "bounded_context_name": "knowledge_retrieval",
+      "module_path": "src/knowledge_retrieval/application/use_cases/execute_retrieval_use_case.py",
+      "trigger_workflow": "WF2 (Product Recommendation) and WF3 (Referral Guidance) — called per retrieval execution",
+      "purpose": "Routes a retrieval query to the correct knowledge source based on source_target. Delegates to the appropriate vector store repository. Returns raw retrieved content chunks as RetrievedEvidenceDTO. Never invents or rewrites content — only returns what the knowledge store provides.",
+
+      "input_command": {
+        "name": "ExecuteRetrievalCommand",
+        "location": "src/knowledge_retrieval/application/use_cases/execute_retrieval_use_case.py",
+        "fields": [
+          { "name": "query_text",    "type": "str",  "note": "Enriched query text constructed by COMP-2 from context snapshot" },
+          { "name": "source_target", "type": "str",  "note": "product_catalog | referral_program_rules" }
+        ]
+      },
+
+      "output_response": {
+        "name": "RetrievedEvidenceDTO",
+        "location": "src/decision_intelligence/application/ports/",
+        "note": "DTO defined in the caller's (COMP-2) port location; mapped from domain retrieval result inside this use case",
+        "fields": [
+          { "name": "chunks",         "type": "list[str]", "note": "Top-matching content text from vector store" },
+          { "name": "evidence_type",  "type": "str",       "note": "product_evidence | referral_rule_evidence" }
+        ]
+      },
+
+      "dependencies": [
+        { "interface": "IProductRepository",      "role": "semantic search over product_catalog collection when source_target=product_catalog" },
+        { "interface": "IReferralRuleRepository", "role": "semantic search over referral_program_rules collection when source_target=referral_program_rules" }
+      ],
+
+      "execution_flow": [
+        "1. Validate source_target is one of: product_catalog, referral_program_rules — raise InvalidTargetError otherwise",
+        "2. Route on source_target:",
+        "   2a. product_catalog: call IProductRepository.search(query_text) → list[Product] (enforces INV-AR-2)",
+        "   2b. referral_program_rules: call IReferralRuleRepository.search(query_text) → list[ReferralRule] (enforces INV-AR-3)",
+        "3. Map retrieved entities to RetrievedEvidenceDTO:",
+        "   - chunks: list of content text strings extracted from retrieved entities",
+        "   - evidence_type: product_evidence | referral_rule_evidence based on source_target",
+        "4. Return RetrievedEvidenceDTO"
+      ],
+
+      "invariants_enforced": [
+        "INV-AR-2 — product recommendations grounded only in retrieved products (IProductRepository returns only existing catalog items)",
+        "INV-AR-3 — referral guidance grounded only in retrieved referral rules (IReferralRuleRepository returns only existing rules)",
+        "INV-AR-4 — this use case does not generate or rewrite content; it only retrieves"
+      ],
+
+      "cross_context_calls": [],
+
+      "notes": "This is the leaf use case in the system dependency chain. COMP-3 has no outbound dependencies. It receives a query and returns raw content — quality evaluation (recall/precision scoring) happens in COMP-2, not here. This use case is invoked by KnowledgeRetrievalAdapter (shell) on behalf of COMP-2."
+    }
+
+  ],
+
+  "folder_structure": {
+    "note": "Use cases live in the application layer of each bounded context. Commands and responses are co-located with their use case file.",
+    "BC-1": {
+      "root": "src/conversation_management/application/use_cases/",
+      "files": [
+        "start_session_use_case.py",
+        "process_turn_use_case.py",
+        "close_session_use_case.py"
+      ]
+    },
+    "BC-2": {
+      "root": "src/decision_intelligence/application/use_cases/",
+      "files": [
+        "pre_seed_context_use_case.py",
+        "process_turn_intelligence_use_case.py"
+      ]
+    },
+    "BC-3": {
+      "root": "src/knowledge_retrieval/application/use_cases/",
+      "files": [
+        "execute_retrieval_use_case.py"
+      ]
+    }
+  },
+
+  "dtos_summary": {
+    "note": "Cross-context DTOs are positioned adjacent to the port interface they serve, in the caller's application layer.",
+    "dtos": [
+      {
+        "name": "PreSeedContextDTO",
+        "location": "src/conversation_management/application/ports/",
+        "direction": "COMP-1 → COMP-2",
+        "used_by": "StartSessionUseCase → IDecisionIntelligenceService.pre_seed_context"
+      },
+      {
+        "name": "TurnInputDTO",
+        "location": "src/conversation_management/application/ports/",
+        "direction": "COMP-1 → COMP-2",
+        "used_by": "ProcessTurnUseCase (via TurnGraph) → IDecisionIntelligenceService.process_turn",
+        "fields": ["session_id", "intent", "message", "turn_number"]
+      },
+      {
+        "name": "TurnIntelligenceResultDTO",
+        "location": "src/conversation_management/application/ports/",
+        "direction": "COMP-2 → COMP-1",
+        "used_by": "ProcessTurnIntelligenceUseCase → DecisionIntelligenceAdapter → ProcessTurnUseCase (via TurnGraph)"
+      },
+      {
+        "name": "RetrievalQueryDTO",
+        "location": "src/decision_intelligence/application/ports/",
+        "direction": "COMP-2 → COMP-3",
+        "used_by": "ProcessTurnIntelligenceUseCase (via DecisionIntelligenceSubgraph) → IKnowledgeRetrievalService.retrieve",
+        "fields": ["query_text", "source_target"]
+      },
+      {
+        "name": "RetrievedEvidenceDTO",
+        "location": "src/decision_intelligence/application/ports/",
+        "direction": "COMP-3 → COMP-2",
+        "used_by": "ExecuteRetrievalUseCase → KnowledgeRetrievalAdapter → ProcessTurnIntelligenceUseCase",
+        "fields": ["chunks", "evidence_type"]
+      }
+    ]
+  },
+
+  "call_chain_summary": {
+    "per_turn": [
+      "shell/api → ProcessTurnUseCase (UC-2) [BC-1]",
+      "  → TurnGraph node → IDecisionIntelligenceService.process_turn → DecisionIntelligenceAdapter (shell)",
+      "    → ProcessTurnIntelligenceUseCase (UC-5) [BC-2]",
+      "      → DecisionIntelligenceSubgraph node → IKnowledgeRetrievalService.retrieve → KnowledgeRetrievalAdapter (shell)",
+      "        → ExecuteRetrievalUseCase (UC-6) [BC-3]",
+      "      ← RetrievedEvidenceDTO",
+      "    ← TurnIntelligenceResult",
+      "  ← TurnIntelligenceResultDTO",
+      "← ProcessTurnResponse"
+    ],
+    "session_init": [
+      "shell/api → StartSessionUseCase (UC-1) [BC-1]",
+      "  → IDecisionIntelligenceService.pre_seed_context → DecisionIntelligenceAdapter (shell)",
+      "    → PreSeedContextUseCase (UC-4) [BC-2]",
+      "  ← void",
+      "← StartSessionResponse"
+    ],
+    "session_close": [
+      "shell/api → CloseSessionUseCase (UC-3) [BC-1]",
+      "← CloseSessionResponse"
+    ]
+  }
+}

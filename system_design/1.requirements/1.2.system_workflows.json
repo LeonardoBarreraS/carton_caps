@@ -1,0 +1,223 @@
+{
+  "system": "Carton Caps Conversational Assistant",
+  "version": "1.0",
+  "design_principle": "The conversation never resets. Context accumulates across all turns. Behavioral workflows activate based on detected intent and context state, all inside the same continuous session.",
+  "rag_core_pattern": {
+    "description": "Applied in WF2 and WF3. The retrieval query is never just the raw user message. It is always enriched by the accumulated decision context. Evaluation gates enforce retrieval quality and response quality before proceeding.",
+    "pipeline": [
+      "decision context + intent",
+      "construct retrieval query",
+      "retrieve relevant evidence",
+      "evaluate context quality (recall + precision scores)",
+      "inject evidence into generation",
+      "generate grounded response",
+      "evaluate response quality (groundedness + relevance scores)",
+      "return validated response"
+    ]
+  },
+  "workflows": [
+    {
+      "id": "WF0",
+      "name": "Conversational Response Loop",
+      "type": "primary",
+      "description": "Master loop executed for every user message. Classifies intent, updates context, retrieves knowledge, and generates a response. Orchestrates all secondary workflows.",
+      "trigger": "Every user message",
+      "entry": "User sends a message with a session identifier",
+      "exit": "Assistant response and context snapshot returned to caller",
+      "loop": "Repeats for every conversation turn",
+      "transitions": [
+        {
+          "step": "receive message",
+          "description": "User message arrives with session identifier"
+        },
+        {
+          "step": "classify intent",
+          "description": "System determines the type of interaction (maps to FR2)"
+        },
+        {
+          "step": "update context",
+          "description": "Signals extracted and decision context enriched (activates WF1)"
+        },
+        {
+          "step": "construct retrieval query",
+          "description": "Retrieval query built from intent + accumulated context, not raw message (maps to FR4)"
+        },
+        {
+          "step": "retrieve evidence",
+          "description": "Relevant content fetched from appropriate knowledge source (activates WF2 or WF3)"
+        },
+        {
+          "step": "evaluate context quality",
+          "description": "context_recall_score and context_precision_score computed on RetrievedEvidence. If recall < threshold, query is refined and retrieval retried before proceeding."
+        },
+        {
+          "step": "generate grounded response",
+          "description": "Response produced using retrieved evidence and decision context"
+        },
+        {
+          "step": "evaluate response quality",
+          "description": "groundedness_score and relevance_score computed on AssistantResponse. If either < threshold, response is blocked and a safe fallback returned."
+        },
+        {
+          "step": "return response",
+          "description": "Validated assistant response and context snapshot delivered to caller"
+        }
+      ]
+    },
+    {
+      "id": "WF1",
+      "name": "Decision Context Building",
+      "type": "secondary",
+      "description": "Runs inside every turn. Progressively builds a structured understanding of user preferences, constraints, and fundraising intent from conversation signals.",
+      "trigger": "Any user message",
+      "pre_condition": "At session start, DecisionContext is already seeded with the user's school (from DB), prior conversation signals (from ConversationHistory if any), and purchase signals (from PurchaseHistory if populated). WF1 enriches this context further with each new user turn.",
+      "purpose": "Progressively understand user needs, preferences, and fundraising intent",
+      "transitions": [
+        {
+          "step": "message received",
+          "description": "New user message available for analysis"
+        },
+        {
+          "step": "signals extracted",
+          "description": "Preferences and constraints identified from the message"
+        },
+        {
+          "step": "context updated",
+          "description": "Decision context enriched with newly extracted signals"
+        },
+        {
+          "step": "gaps evaluated",
+          "description": "System checks whether the context is sufficient for a recommendation"
+        },
+        {
+          "step": "clarification requested",
+          "description": "One targeted question asked when gaps exist. This step is optional.",
+          "optional": true
+        },
+        {
+          "step": "context ready",
+          "description": "Sufficient context available to activate product recommendation workflow"
+        }
+      ],
+      "example": {
+        "user_message": "My kids are picky",
+        "signal_extracted": { "kids": "picky" },
+        "gap_detected": "product_type unknown",
+        "clarification": "Are you looking for snacks or breakfast items?"
+      }
+    },
+    {
+      "id": "WF2",
+      "name": "Product Recommendation",
+      "type": "secondary",
+      "description": "Guides the user toward a personalized product decision grounded in the accumulated decision context and retrieved product data.",
+      "trigger": "product_inquiry intent OR decision context is ready (WF1 exited with context ready)",
+      "purpose": "Guide the user toward a personalized product decision",
+      "transitions": [
+        {
+          "step": "context evaluated",
+          "description": "Decision context checked for sufficient preference signals"
+        },
+        {
+          "step": "retrieval query constructed",
+          "description": "Query built from decision context (e.g., 'healthy snacks for picky children'), not raw user message"
+        },
+        {
+          "step": "products retrieved",
+          "description": "Product catalog queried with enriched query; top results returned"
+        },
+        {
+          "step": "context quality evaluated",
+          "description": "context_recall_score and context_precision_score computed on RetrievedEvidence. If recall < threshold, query is refined and retrieval retried."
+        },
+        {
+          "step": "evidence injected",
+          "description": "Retrieved products (with passing quality scores) passed as grounded context into the generation step"
+        },
+        {
+          "step": "recommendation generated",
+          "description": "Personalized recommendation produced citing only retrieved products, with explicit connection to the user's school fundraising goal"
+        },
+        {
+          "step": "response formulated",
+          "description": "Response structured with product suggestions and preference-aligned reasoning"
+        }
+      ],
+      "example": {
+        "context": { "kids": "picky", "preference": "healthy" },
+        "retrieval_query": "healthy snacks suitable for picky children",
+        "products_retrieved": "top matching items from product catalog",
+        "evidence_injected": true,
+        "response": "These healthy snack options work well for picky kids: [retrieved products]"
+      }
+    },
+    {
+      "id": "WF3",
+      "name": "Referral Guidance",
+      "type": "secondary",
+      "description": "Explains the referral program mechanics and encourages the user to take a referral action to increase school fundraising.",
+      "trigger": "referral_question intent OR fundraising support opportunity detected in conversation",
+      "purpose": "Explain the referral program mechanics and encourage the user to take action",
+      "transitions": [
+        {
+          "step": "referral intent detected",
+          "description": "User signals interest in helping their school or in referrals"
+        },
+        {
+          "step": "retrieval query constructed",
+          "description": "Query built from intent and fundraising context signals"
+        },
+        {
+          "step": "referral rules retrieved",
+          "description": "Platform-specific referral rules fetched from knowledge base"
+        },
+        {
+          "step": "context quality evaluated",
+          "description": "context_recall_score and context_precision_score computed on RetrievedEvidence. If recall < threshold, query is refined and retrieval retried."
+        },
+        {
+          "step": "evidence injected",
+          "description": "Retrieved rules (with passing quality scores) passed as grounded context into the generation step"
+        },
+        {
+          "step": "guidance formulated",
+          "description": "Explanation built strictly from retrieved rules, not LLM memory"
+        },
+        {
+          "step": "action suggested",
+          "description": "Specific referral action recommended based on retrieved eligibility rules"
+        },
+        {
+          "step": "response returned",
+          "description": "Guidance and suggested action delivered to the user"
+        }
+      ],
+      "example": {
+        "user_message": "How do I help my school more?",
+        "intent": "referral_question",
+        "retrieval_query": "referral program rules school donation bonus",
+        "rules_retrieved": "referral eligibility, bonus mechanics, invitation flow",
+        "evidence_injected": true,
+        "response": "Inviting other parents increases school donations. Here is how the referral program works: [retrieved rules]"
+      }
+    }
+  ],
+  "workflow_interaction": {
+    "model": "All secondary workflows run inside the primary loop. A single user message activates WF1 always, plus one or more additional workflows depending on detected intent.",
+    "routing_rules": [
+      {
+        "condition": "Always",
+        "activates": "WF1"
+      },
+      {
+        "condition": "product_inquiry intent OR decision context is ready",
+        "activates": "WF2"
+      },
+      {
+        "condition": "referral_question intent OR fundraising opportunity detected",
+        "activates": "WF3"
+      }
+    ],
+    "note": "WF2 and WF3 can both activate in the same turn if the user message contains both product and referral signals."
+  }
+}

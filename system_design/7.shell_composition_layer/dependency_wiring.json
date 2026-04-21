@@ -1,0 +1,463 @@
+{
+  "system": "Carton Caps Conversational Assistant",
+  "version": "1.0",
+  "phase": "7 — Shell / Composition Layer",
+  "task": "Dependency Wiring",
+  "derived_from": [
+    "use_cases.json",
+    "adapters.json",
+    "repositories.json",
+    "event_bus.json",
+    "context_communication.json",
+    "layered_architecture.json"
+  ],
+  "composition_root_file": "src/shell/composition/container.py",
+
+  "design_principles": [
+    "Shell is the single composition root — the only place in the system permitted to import from multiple bounded contexts simultaneously",
+    "All wiring lives in src/shell/composition/ — never inside a bounded context",
+    "Constructor injection is used exclusively — no service locator, no global registry, no static singletons",
+    "The object graph is assembled once at startup; all use cases receive fully-constructed dependencies",
+    "Cross-context communication uses synchronous adapter port calls — not event subscriptions — matching the RAG pipeline's inherently synchronous flow",
+    "Domain events are observability signals only; the single event publisher (LoggingEventPublisher) is a drain, not a behavioral dispatcher",
+    "Dependency direction is strictly inward: shell → infrastructure → application → domain",
+    "No bounded context imports from the shell layer"
+  ],
+
+  "wiring_model": {
+    "inter_context_mechanism": "synchronous_adapter_port_calls",
+    "event_mechanism": "observability_drain_only",
+    "rationale": [
+      "The RAG pipeline is inherently synchronous — evidence retrieval must complete before response generation can begin; async cross-context routing adds latency with no behavioral benefit",
+      "Domain events (SessionStarted, TurnProcessed, SessionClosed, ContextUpdated, GapDetected, ContextReady) are factual records for observability — they do not trigger business logic in any other context",
+      "An event subscription infrastructure would have registered handlers that exist purely to log — that is machinery with no justified complexity",
+      "All inter-context coordination is fully covered by two synchronous port interfaces (COMM-1, COMM-2)"
+    ]
+  },
+
+  "bounded_contexts": [
+    {
+      "id": "BC-1",
+      "name": "conversation_management",
+      "role": "primary driver — owns session lifecycle, turn orchestration, and the public API surface",
+      "exposes_to_shell": [
+        "StartSessionUseCase",
+        "ProcessTurnUseCase",
+        "CloseSessionUseCase"
+      ],
+      "consumes_via_ports": [
+        "IDecisionIntelligenceService (COMM-1 → BC-2)"
+      ],
+      "publishes_events": [
+        "SessionStarted",
+        "TurnProcessed",
+        "SessionClosed"
+      ]
+    },
+    {
+      "id": "BC-2",
+      "name": "decision_intelligence",
+      "role": "reasoning engine — owns DecisionContext lifecycle, signal extraction, evidence evaluation, and gap detection",
+      "exposes_to_shell": [
+        "PreSeedContextUseCase",
+        "ProcessTurnIntelligenceUseCase"
+      ],
+      "consumes_via_ports": [
+        "IKnowledgeRetrievalService (COMM-2 → BC-3)"
+      ],
+      "publishes_events": [
+        "ContextUpdated",
+        "GapDetected",
+        "ContextReady"
+      ]
+    },
+    {
+      "id": "BC-3",
+      "name": "knowledge_retrieval",
+      "role": "semantic search — owns vector store queries for products and referral rules",
+      "exposes_to_shell": [
+        "ExecuteRetrievalUseCase"
+      ],
+      "consumes_via_ports": [],
+      "publishes_events": []
+    }
+  ],
+
+  "cross_context_wiring": [
+    {
+      "id": "COMM-1",
+      "direction": "BC-1 → BC-2",
+      "mechanism": "synchronous port call",
+      "port_interface": "IDecisionIntelligenceService",
+      "port_defined_in": "src/conversation_management/application/ports/i_decision_intelligence_service.py",
+      "adapter": "DecisionIntelligenceAdapter",
+      "adapter_location": "src/shell/composition/adapters/decision_intelligence_adapter.py",
+      "methods": [
+        {
+          "name": "pre_seed_context",
+          "input_dto": "PreSeedContextDTO",
+          "output": "None",
+          "called_by": "StartSessionUseCase",
+          "when": "once per session, during initialization"
+        },
+        {
+          "name": "process_turn",
+          "input_dto": "TurnInputDTO",
+          "output": "TurnIntelligenceResultDTO",
+          "called_by": "ProcessTurnUseCase (via TurnGraph)",
+          "when": "every turn, after intent classification"
+        }
+      ],
+      "translation": "DTOs carry only primitives — no BC-1 domain objects cross into BC-2 and vice versa",
+      "wiring_in_container": [
+        "decision_intelligence_adapter = DecisionIntelligenceAdapter(pre_seed_use_case=pre_seed_uc, process_turn_use_case=process_turn_intelligence_uc)",
+        "start_session_uc = StartSessionUseCase(..., decision_intelligence_service=decision_intelligence_adapter, ...)",
+        "process_turn_uc = ProcessTurnUseCase(..., decision_intelligence_service=decision_intelligence_adapter, ...)"
+      ]
+    },
+    {
+      "id": "COMM-2",
+      "direction": "BC-2 → BC-3",
+      "mechanism": "synchronous port call",
+      "port_interface": "IKnowledgeRetrievalService",
+      "port_defined_in": "src/decision_intelligence/application/ports/i_knowledge_retrieval_service.py",
+      "adapter": "KnowledgeRetrievalAdapter",
+      "adapter_location": "src/shell/composition/adapters/knowledge_retrieval_adapter.py",
+      "methods": [
+        {
+          "name": "retrieve",
+          "input_dto": "RetrievalQueryDTO",
+          "output": "RetrievedEvidenceDTO",
+          "called_by": "ProcessTurnIntelligenceUseCase (via DecisionIntelligenceSubgraph)",
+          "when": "when DecisionContext has reached ready/enriched state and intent is product_inquiry or referral_inquiry"
+        }
+      ],
+      "translation": "DTOs carry only primitives — no BC-2 domain objects cross into BC-3",
+      "wiring_in_container": [
+        "knowledge_retrieval_adapter = KnowledgeRetrievalAdapter(execute_retrieval_use_case=execute_retrieval_uc)",
+        "process_turn_intelligence_uc = ProcessTurnIntelligenceUseCase(..., knowledge_retrieval_service=knowledge_retrieval_adapter, ...)"
+      ]
+    }
+  ],
+
+  "event_publisher_wiring": {
+    "implementation": "LoggingEventPublisher",
+    "location": "src/shell/composition/logging_event_publisher.py",
+    "implements_ports": [
+      {
+        "port": "IEventPublisher",
+        "bounded_context": "BC-1",
+        "port_location": "src/conversation_management/application/ports/i_event_publisher.py"
+      },
+      {
+        "port": "IEventPublisher",
+        "bounded_context": "BC-2",
+        "port_location": "src/decision_intelligence/application/ports/i_event_publisher.py"
+      }
+    ],
+    "pattern": "multiple_inheritance — single instance satisfies both ports",
+    "wired_to": [
+      { "use_case": "StartSessionUseCase",               "bounded_context": "BC-1", "events_received": ["SessionStarted"] },
+      { "use_case": "ProcessTurnUseCase",                "bounded_context": "BC-1", "events_received": ["TurnProcessed"] },
+      { "use_case": "CloseSessionUseCase",               "bounded_context": "BC-1", "events_received": ["SessionClosed"] },
+      { "use_case": "ProcessTurnIntelligenceUseCase",    "bounded_context": "BC-2", "events_received": ["ContextUpdated", "GapDetected", "ContextReady"] }
+    ],
+    "sink": "file — data/domain_events.log (override via DOMAIN_EVENT_LOG_PATH environment variable)",
+    "behavior": "synchronous drain — events collected inside use case boundary, published in a single batch; never raises; write failures are silently swallowed so the turn pipeline is never interrupted",
+    "note": "Events are NOT routed across context boundaries. LoggingEventPublisher is the sole consumer of all domain events. There are no cross-context event handlers."
+  },
+
+  "infrastructure_wiring": [
+    {
+      "id": "WIRE-1",
+      "port": "IConversationSessionRepository",
+      "implementation": "InMemoryConversationSessionRepository",
+      "bounded_context": "BC-1",
+      "injected_into": ["StartSessionUseCase", "ProcessTurnUseCase", "CloseSessionUseCase"],
+      "storage": "Python dict (in-process)",
+      "rationale": "Session state is turn-scoped and does not need to survive process restarts at prototype scale",
+      "adapter_id": "ADAPT-9"
+    },
+    {
+      "id": "WIRE-2",
+      "port": "IConversationHistoryRepository",
+      "implementation": "SQLiteConversationHistoryRepository",
+      "bounded_context": "BC-1",
+      "injected_into": ["StartSessionUseCase", "ProcessTurnUseCase"],
+      "storage": "SQLite — carton_caps_data.sqlite (Conversation_History table)",
+      "rationale": "Conversation history must survive process restarts; SQLite provides zero-setup durability at prototype scale",
+      "adapter_id": "ADAPT-16"
+    },
+    {
+      "id": "WIRE-3",
+      "port": "IUserRepository",
+      "implementation": "SQLiteUserRepository",
+      "bounded_context": "BC-1",
+      "injected_into": ["StartSessionUseCase", "ProcessTurnUseCase"],
+      "storage": "SQLite — carton_caps_data.sqlite (Users table, read-only)",
+      "rationale": "User identity is managed externally; this system only reads the pre-existing fixture. ProcessTurnUseCase loads User.name for LLM personalization before TurnGraph invocation.",
+      "adapter_id": "ADAPT-11"
+    },
+    {
+      "id": "WIRE-4",
+      "port": "ISchoolRepository",
+      "implementation": "SQLiteSchoolRepository",
+      "bounded_context": "BC-1",
+      "injected_into": ["StartSessionUseCase", "ProcessTurnUseCase"],
+      "storage": "SQLite — carton_caps_data.sqlite (Schools + Users JOIN, read-only)",
+      "rationale": "School is the fundraising anchor resolved at session init; also loaded by ProcessTurnUseCase for LLM personalization. Read-only from existing fixture.",
+      "adapter_id": "ADAPT-12"
+    },
+    {
+      "id": "WIRE-5",
+      "port": "IPurchaseHistoryRepository",
+      "implementation": "SQLitePurchaseHistoryRepository",
+      "bounded_context": "BC-1",
+      "injected_into": ["StartSessionUseCase"],
+      "storage": "SQLite — carton_caps_data.sqlite (Purchase_History + Products JOIN, read-only)",
+      "rationale": "Purchase signals pre-seed DecisionContext; read-only from existing fixture, passed as primitives via PreSeedContextDTO",
+      "adapter_id": "ADAPT-13"
+    },
+    {
+      "id": "WIRE-6",
+      "port": "IIntentClassifier",
+      "implementation": "OpenAIIntentClassifier",
+      "bounded_context": "BC-1",
+      "injected_into": ["ProcessTurnUseCase (via TurnGraph)"],
+      "storage": "OpenAI Chat Completions API — gpt-4o-mini",
+      "rationale": "Fast, cheap structured output for intent classification",
+      "adapter_id": "ADAPT-2"
+    },
+    {
+      "id": "WIRE-7",
+      "port": "IResponseGenerator",
+      "implementation": "OpenAIResponseGenerator",
+      "bounded_context": "BC-1",
+      "injected_into": ["ProcessTurnUseCase (via TurnGraph)"],
+      "storage": "OpenAI Chat Completions API — gpt-4o",
+      "rationale": "Quality response generation; gpt-4o used here for best output quality",
+      "adapter_id": "ADAPT-3"
+    },
+    {
+      "id": "WIRE-8",
+      "port": "IResponseEvaluator",
+      "implementation": "OpenAIResponseEvaluator",
+      "bounded_context": "BC-1",
+      "injected_into": ["ProcessTurnUseCase (via TurnGraph)"],
+      "storage": "OpenAI Chat Completions API — gpt-4o-mini",
+      "rationale": "Fast evaluation of groundedness and relevance scores",
+      "adapter_id": "ADAPT-4"
+    },
+    {
+      "id": "WIRE-9",
+      "port": "IDecisionContextRepository",
+      "implementation": "InMemoryDecisionContextRepository",
+      "bounded_context": "BC-2",
+      "injected_into": ["PreSeedContextUseCase", "ProcessTurnIntelligenceUseCase"],
+      "storage": "Python dict (in-process)",
+      "rationale": "DecisionContext is session-scoped; prototype scope requires no persistence across restarts",
+      "adapter_id": "ADAPT-14"
+    },
+    {
+      "id": "WIRE-10",
+      "port": "ISignalExtractor",
+      "implementation": "OpenAISignalExtractor",
+      "bounded_context": "BC-2",
+      "injected_into": ["ProcessTurnIntelligenceUseCase (via DecisionIntelligenceSubgraph)"],
+      "storage": "OpenAI Chat Completions API — gpt-4o-mini",
+      "rationale": "Structured JSON extraction of preference signals from user messages",
+      "adapter_id": "ADAPT-5"
+    },
+    {
+      "id": "WIRE-11",
+      "port": "IEvidenceEvaluator",
+      "implementation": "OpenAIEvidenceEvaluator",
+      "bounded_context": "BC-2",
+      "injected_into": ["ProcessTurnIntelligenceUseCase (via DecisionIntelligenceSubgraph)"],
+      "storage": "OpenAI Chat Completions API — gpt-4o-mini",
+      "rationale": "Scores context recall and precision of retrieved evidence",
+      "adapter_id": "ADAPT-6"
+    },
+    {
+      "id": "WIRE-12",
+      "port": "IProductRepository",
+      "implementation": "QdrantProductRepository",
+      "bounded_context": "BC-3",
+      "injected_into": ["ExecuteRetrievalUseCase"],
+      "storage": "Qdrant — product_catalog collection",
+      "rationale": "Semantic vector search over product catalog; same embedding model as ingestion (text-embedding-3-small) guarantees cosine distance correctness",
+      "adapter_id": "ADAPT-7"
+    },
+    {
+      "id": "WIRE-13",
+      "port": "IReferralRuleRepository",
+      "implementation": "QdrantReferralRuleRepository",
+      "bounded_context": "BC-3",
+      "injected_into": ["ExecuteRetrievalUseCase"],
+      "storage": "Qdrant — referral_program_rules collection",
+      "rationale": "Semantic vector search over referral program rules; same embedding model as ingestion",
+      "adapter_id": "ADAPT-8"
+    },
+    {
+      "id": "WIRE-14",
+      "port": "IEventPublisher (BC-1 + BC-2)",
+      "implementation": "LoggingEventPublisher",
+      "bounded_context": "cross-cutting — shell",
+      "injected_into": ["StartSessionUseCase", "ProcessTurnUseCase", "CloseSessionUseCase", "ProcessTurnIntelligenceUseCase"],
+      "storage": "file — data/domain_events.log",
+      "rationale": "Single shell-layer implementation satisfies both BC-1 and BC-2 event publisher ports via multiple inheritance",
+      "adapter_id": "ADAPT-17"
+    },
+    {
+      "id": "WIRE-15",
+      "port": "IRAGMetricsLogger",
+      "implementation": "SQLiteRAGMetricsLogger",
+      "bounded_context": "BC-1",
+      "injected_into": ["ProcessTurnUseCase"],
+      "storage": "SQLite — data/rag_metrics.sqlite",
+      "rationale": "Persists per-turn RAG evaluation metrics (groundedness, relevance, context scores, fallback rate) after each TurnGraph execution",
+      "adapter_id": "ADAPT-15"
+    }
+  ],
+
+  "implementation_note": {
+    "id": "WIRE-15-NOTE",
+    "adapter_id": "ADAPT-15",
+    "port": "IRAGMetricsLogger",
+    "implementation": "SQLiteRAGMetricsLogger",
+    "implementation_location": "src/conversation_management/infrastructure/observability/sqlite_rag_metrics_logger.py",
+    "port_location": "src/conversation_management/application/ports/i_rag_metrics_logger.py",
+    "status": "WIRED",
+    "description": "ProcessTurnUseCase accepts rag_metrics_logger: IRAGMetricsLogger as a constructor dependency and calls self._rag_metrics_logger.log_turn_metrics(...) after TurnGraph completes. build_container() instantiates SQLiteRAGMetricsLogger(db_path=rag_metrics_db_path) and injects it into ProcessTurnUseCase.",
+    "impact": "Per-turn RAG evaluation metrics (groundedness, relevance, context state, fallback rate, context recall, context precision) are persisted to data/rag_metrics.sqlite on every turn."
+  },
+
+  "object_graph_assembly_order": [
+    {
+      "step": 1,
+      "label": "Configuration",
+      "items": ["load_dotenv()", "openai_api_key", "sqlite_db_path", "domain_event_log_path", "qdrant_url", "llm_model", "min_groundedness", "min_relevance", "rag_metrics_db_path"]
+    },
+    {
+      "step": 2,
+      "label": "Shared clients",
+      "items": ["openai_client = OpenAI(api_key=openai_api_key)"]
+    },
+    {
+      "step": 3,
+      "label": "BC-3 infrastructure",
+      "items": ["product_repo = QdrantProductRepository(...)", "referral_repo = QdrantReferralRuleRepository(...)"]
+    },
+    {
+      "step": 4,
+      "label": "BC-3 use cases",
+      "items": ["execute_retrieval_uc = ExecuteRetrievalUseCase(product_repository, referral_rule_repository)"]
+    },
+    {
+      "step": 5,
+      "label": "COMM-2 cross-context adapter",
+      "items": ["knowledge_retrieval_adapter = KnowledgeRetrievalAdapter(execute_retrieval_use_case=execute_retrieval_uc)"]
+    },
+    {
+      "step": 6,
+      "label": "BC-2 infrastructure",
+      "items": ["decision_context_repo = InMemoryDecisionContextRepository()", "signal_extractor = OpenAISignalExtractor(...)", "evidence_evaluator = OpenAIEvidenceEvaluator(...)"]
+    },
+    {
+      "step": 7,
+      "label": "BC-2 use cases",
+      "items": ["pre_seed_uc = PreSeedContextUseCase(decision_context_repository=decision_context_repo)", "process_turn_intelligence_uc = ProcessTurnIntelligenceUseCase(..., knowledge_retrieval_service=knowledge_retrieval_adapter, ...)"]
+    },
+    {
+      "step": 8,
+      "label": "COMM-1 cross-context adapter",
+      "items": ["decision_intelligence_adapter = DecisionIntelligenceAdapter(pre_seed_use_case=pre_seed_uc, process_turn_use_case=process_turn_intelligence_uc)"]
+    },
+    {
+      "step": 9,
+      "label": "Cross-cutting — event publisher",
+      "items": ["event_publisher = LoggingEventPublisher(log_path=domain_event_log_path)"]
+    },
+    {
+      "step": 10,
+      "label": "BC-1 infrastructure",
+      "items": [
+        "history_repo = SQLiteConversationHistoryRepository(db_path=sqlite_db_path)",
+        "session_repo = InMemoryConversationSessionRepository()",
+        "user_repo = SQLiteUserRepository(db_path=sqlite_db_path)",
+        "school_repo = SQLiteSchoolRepository(db_path=sqlite_db_path)",
+        "purchase_history_repo = SQLitePurchaseHistoryRepository(db_path=sqlite_db_path)",
+        "intent_classifier = OpenAIIntentClassifier(...)",
+        "response_generator = OpenAIResponseGenerator(...)",
+        "response_evaluator = OpenAIResponseEvaluator(...)",
+        "rag_metrics_logger = SQLiteRAGMetricsLogger(rag_metrics_db_path)"
+      ]
+    },
+    {
+      "step": 11,
+      "label": "BC-1 use cases",
+      "items": [
+        "start_session_uc = StartSessionUseCase(..., decision_intelligence_service=decision_intelligence_adapter, event_publisher=event_publisher)",
+        "process_turn_uc = ProcessTurnUseCase(..., decision_intelligence_service=decision_intelligence_adapter, event_publisher=event_publisher, user_repository=user_repo, school_repository=school_repo, rag_metrics_logger=rag_metrics_logger)",
+        "close_session_uc = CloseSessionUseCase(..., event_publisher=event_publisher)"
+      ]
+    },
+    {
+      "step": 12,
+      "label": "Composition root output",
+      "items": ["return AppContainer(start_session=start_session_uc, process_turn=process_turn_uc, close_session=close_session_uc)"]
+    }
+  ],
+
+  "configuration_keys": [
+    { "env_var": "OPENAI_API_KEY",         "default": "",                                                 "used_by": "OpenAI client (all LLM adapters)" },
+    { "env_var": "SQLITE_DB_PATH",         "default": "data/carton_caps_data.sqlite (relative to root)", "used_by": "All SQLite repositories" },
+    { "env_var": "DOMAIN_EVENT_LOG_PATH",  "default": "data/domain_events.log (relative to root)",       "used_by": "LoggingEventPublisher" },
+    { "env_var": "QDRANT_URL",             "default": "http://localhost:6333",                            "used_by": "QdrantProductRepository, QdrantReferralRuleRepository" },
+    { "env_var": "LLM_MODEL",              "default": "gpt-4o-mini",                                      "used_by": "All OpenAI adapters" },
+    { "env_var": "MIN_GROUNDEDNESS",       "default": "0.8",                                              "used_by": "ProcessTurnUseCase quality gate" },
+    { "env_var": "MIN_RELEVANCE",          "default": "0.75",                                             "used_by": "ProcessTurnUseCase quality gate" }
+  ],
+
+  "shell_folder_structure": {
+    "src/shell/": {
+      "__init__.py": "",
+      "api/": {
+        "__init__.py": "",
+        "app.py":     "FastAPI factory — create_app(), exception handlers",
+        "router.py":  "Route handlers — POST /sessions, POST /sessions/{id}/turns, DELETE /sessions/{id}",
+        "schemas.py": "Pydantic request/response/error models"
+      },
+      "composition/": {
+        "__init__.py": "",
+        "container.py":               "Composition root — build_container() → AppContainer",
+        "logging_event_publisher.py": "LoggingEventPublisher — implements BC-1 + BC-2 IEventPublisher",
+        "adapters/": {
+          "__init__.py": "",
+          "decision_intelligence_adapter.py": "COMM-1 bridge — BC-1 IDecisionIntelligenceService → BC-2 use cases",
+          "knowledge_retrieval_adapter.py":   "COMM-2 bridge — BC-2 IKnowledgeRetrievalService → BC-3 use cases"
+        }
+      }
+    },
+    "main.py": "ASGI entry point — app = create_app()"
+  },
+
+  "wiring_rules": {
+    "must": [
+      "All wiring must live exclusively in src/shell/composition/",
+      "Implementations instantiated at startup — not on-demand",
+      "Constructor injection for every dependency",
+      "Object graph assembled in bottom-up order: BC-3 → COMM-2 → BC-2 → COMM-1 → event_publisher → BC-1",
+      "Single shared OpenAI client instance across all LLM adapters",
+      "Single shared LoggingEventPublisher instance across all use cases in BC-1 and BC-2"
+    ],
+    "must_not": [
+      "No domain logic in wiring code",
+      "No bounded context may import from src/shell/",
+      "No service locator pattern — all dependencies resolved at composition time",
+      "No event_bus.subscribe() calls — there are no cross-context event handlers",
+      "No async dispatch infrastructure — the RAG pipeline is synchronous by design",
+      "No external message broker (Kafka, RabbitMQ, Redis Streams) — out of scope for this prototype"
+    ]
+  }
+}

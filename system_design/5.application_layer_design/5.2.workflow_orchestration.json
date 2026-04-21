@@ -1,0 +1,638 @@
+{
+  "system": "Carton Caps Conversational Assistant",
+  "version": "1.0",
+  "phase": "5 — Application Layer Design",
+  "task": "Workflow Orchestration",
+  "derived_from": [
+    "use_cases.json",
+    "domain_model.json",
+    "context_communication.json",
+    "components.json",
+    "layered_architecture.json",
+    "system_workflows.json"
+  ],
+  "design_principles": [
+    "Workflows are execution engines — they orchestrate domain behavior, they do not implement domain rules",
+    "Domain objects (aggregates, process entities) are loaded by the parent use case and passed into nodes as injected dependencies — they never live inside graph state",
+    "Graph state carries only primitives and read-only snapshots — never mutable domain objects",
+    "Nodes call ports only — LLM adapters, evaluators, repositories are all behind interfaces",
+    "Conditional edges encode application-level routing decisions driven by domain state (intent, context_state, scores)",
+    "LangGraph is the execution engine for both graphs — nodes are thin wrappers; all logic is in domain objects or ports",
+    "The parent use case owns the transaction boundary: it loads aggregates before graph invocation, saves them after graph returns",
+    "Retry logic (retrieval retry cycle) is encoded as a conditional back-edge — not as imperative retry code"
+  ],
+
+  "workflows": [
+
+    {
+      "id": "WF-GRAPH-1",
+      "name": "TurnGraph",
+      "type": "LangGraph StateGraph",
+      "parent_use_case": "ProcessTurnUseCase (UC-2)",
+      "component": "COMP-1",
+      "bounded_context": "BC-1",
+      "bounded_context_name": "conversation_management",
+      "module_path": "src/conversation_management/application/workflows/turn_graph.py",
+      "purpose": "Executes the full conversation turn pipeline inside ProcessTurnUseCase. Classifies intent, routes no-retrieval intents (out_of_scope, general_question) directly to a unified generate_redirect node, delegates RAG intents to Decision Intelligence for evidence retrieval, generates a grounded response, evaluates quality, and either persists the turn or routes to generate_redirect on quality failure. This graph is the application-level process engine for WF0.",
+      "entry_node": "classify_intent",
+
+      "domain_objects_coordinated": [
+        {
+          "object": "ConversationSession",
+          "type": "aggregate_root / process_entity",
+          "how": "Loaded by parent use case before graph invocation. Parent use case calls session.receive_message() before invoking graph. Parent use case calls session.complete_turn() after graph returns. NOT passed into graph state — interacted with only at use case level."
+        },
+        {
+          "object": "Intent",
+          "type": "value_object",
+          "how": "Produced by classify_intent node. Stored as string value in TurnGraphState.intent. Used by routing edges to determine subsequent node."
+        },
+        {
+          "object": "AssistantResponse",
+          "type": "value_object",
+          "how": "Produced by generate_response, generate_clarification, or generate_redirect node. Evaluated by evaluate_response node. Response text and scores stored as primitives in TurnGraphState. generate_redirect uses IResponseGenerator.generate_redirect() — no fallback static text; always an LLM-generated personalised response."
+        },
+        {
+          "object": "ConversationHistory",
+          "type": "entity",
+          "how": "Created and persisted inside persist_turn node. Two entries appended per turn: user message entry + assistant response entry."
+        }
+      ],
+
+      "graph_state": {
+        "name": "TurnGraphState",
+        "description": "Typed state schema flowing between TurnGraph nodes. Carries only turn-scoped primitives — no domain objects.",
+        "fields": [
+          { "name": "session_id",             "type": "str",            "set_by": "use case (initialization)" },
+          { "name": "user_id",                "type": "str",            "set_by": "use case (initialization)" },
+          { "name": "message",                "type": "str",            "set_by": "use case (initialization)" },
+          { "name": "turn_number",            "type": "int",            "set_by": "use case (initialization)" },
+          { "name": "conversation_history",   "type": "list[dict]",    "set_by": "use case (initialization) — full prior conversation as OpenAI-format messages [{\"role\": \"user\"|\"assistant\", \"content\": str}] loaded from ConversationHistory before graph invocation — sliced to last _LLM_HISTORY_WINDOW (5) messages by _recent() helper inside each node before any LLM call", "default": [] },
+          { "name": "user_name",              "type": "str",            "set_by": "use case (initialization) — loaded from IUserRepository.find_by_id(user_id).name before TurnGraph invocation; forwarded to N3 context_snapshot, N4 and N7 user_context dict for LLM personalization", "default": "" },
+          { "name": "school_name",            "type": "str",            "set_by": "use case (initialization) — loaded from ISchoolRepository.find_by_user_id(user_id).name before TurnGraph invocation", "default": "" },
+          { "name": "intent",                 "type": "str | None",     "set_by": "classify_intent node" },
+          { "name": "evidence_chunks",        "type": "list[str]",      "set_by": "process_decision_intelligence node", "default": [] },
+          { "name": "evidence_type",          "type": "str | None",     "set_by": "process_decision_intelligence node" },
+          { "name": "context_recall_score",   "type": "float",          "set_by": "process_decision_intelligence node", "default": 0.0 },
+          { "name": "context_precision_score","type": "float",          "set_by": "process_decision_intelligence node", "default": 0.0 },
+          { "name": "context_state",          "type": "str | None",     "set_by": "process_decision_intelligence node" },
+          { "name": "clarification_needed",   "type": "bool",           "set_by": "process_decision_intelligence node", "default": false },
+          { "name": "clarification_question", "type": "str | None",     "set_by": "process_decision_intelligence node" },
+          { "name": "response_text",          "type": "str | None",     "set_by": "generate_response, generate_clarification, or generate_redirect node" },
+          { "name": "groundedness_score",     "type": "float",          "set_by": "evaluate_response node", "default": 0.0 },
+          { "name": "relevance_score",        "type": "float",          "set_by": "evaluate_response node", "default": 0.0 },
+          { "name": "is_fallback",            "type": "bool",           "set_by": "use case (initialization) — always false; preserved for API/observability backward compatibility", "default": false }
+        ]
+      },
+
+      "nodes": [
+        {
+          "id": "N1",
+          "name": "classify_intent",
+          "responsibility": "Classifies the user message into an Intent value. Determines downstream routing for the entire turn pipeline.",
+          "reads_from_state": ["message", "conversation_history"],
+          "writes_to_state": ["intent"],
+          "ports_called": [
+            { "port": "IIntentClassifier", "method": "classify(message: str, conversation_history: list[dict]) → Intent", "note": "LLM adapter in BC-1 infrastructure. Full conversation history injected into OpenAI messages so classifier correctly interprets short follow-up messages (e.g. 'yes please') in context." }
+          ],
+          "domain_methods_called": [],
+          "invariants_enforced": ["INV-WF-1 — intent classified before context update and retrieval"]
+        },
+        {
+          "id": "N2",
+          "name": "process_decision_intelligence",
+          "responsibility": "Delegates the full decision intelligence pipeline to COMP-2. Sends intent + message to COMP-2 via port; receives evidence (or clarification signal) back. This node is the cross-context boundary crossing inside the graph.",
+          "reads_from_state": ["session_id", "intent", "message", "turn_number", "conversation_history"],
+          "writes_to_state": ["evidence_chunks", "evidence_type", "context_recall_score", "context_precision_score", "context_state", "clarification_needed", "clarification_question"],
+          "ports_called": [
+            {
+              "port": "IDecisionIntelligenceService",
+              "method": "process_turn(dto: TurnInputDTO) → TurnIntelligenceResultDTO",
+              "dto_out_fields": ["session_id", "intent", "message", "turn_number", "conversation_history"],
+              "dto_in_fields": ["evidence_chunks", "evidence_type", "context_recall_score", "context_precision_score", "context_state", "clarification_needed", "clarification_question"],
+              "note": "Cross-context call → DecisionIntelligenceAdapter (shell) → ProcessTurnIntelligenceUseCase (BC-2). conversation_history passed in TurnInputDTO is windowed to last _LLM_HISTORY_WINDOW (5) messages by _recent() before the cross-context call."
+            }
+          ],
+          "domain_methods_called": [],
+          "invariants_enforced": [
+            "INV-WF-3 — retrieval must complete before generation (enforced inside BC-2; this node blocks until BC-2 returns)",
+            "INV-WF-4 — decision intelligence runs on every turn that requires retrieval (product_inquiry, referral_question)"
+          ]
+        },
+        {
+          "id": "N3",
+          "name": "generate_response",
+          "responsibility": "Generates a grounded AssistantResponse from the retrieved evidence and context snapshot. Only reached for RAG intents (product_inquiry, referral_question, clarification_response) — general_question is now routed directly to generate_redirect at N1, bypassing DI and generation entirely.",
+          "reads_from_state": ["message", "evidence_chunks", "evidence_type", "context_state", "user_name", "school_name"],
+          "writes_to_state": ["response_text"],
+          "ports_called": [
+            {
+              "port": "IResponseGenerator",
+              "method": "generate(message: str, evidence: list[str], context_snapshot: dict) → AssistantResponse",
+              "note": "context_snapshot includes user_name (from state, default 'there') and school_name. LLM system prompt personalised via _SYSTEM_PROMPT_TEMPLATE with both values (INV-AR-4). For no-evidence intents, evidence list is empty."
+            }
+          ],
+          "domain_methods_called": [],
+          "invariants_enforced": [
+            "INV-AR-2 — LLM grounded exclusively on retrieved product evidence",
+            "INV-AR-3 — LLM grounded exclusively on retrieved referral rules",
+            "INV-AR-4 — school reference injected into generation context"
+          ]
+        },
+        {
+          "id": "N4",
+          "name": "generate_clarification",
+          "responsibility": "Produces a clarification question response. Source is the clarification_question from DecisionIntelligence (gap detected in context) or a generated prompt for ambiguous intent. Sets response_text to the clarification question text. NOTE: the ambiguous intent routes here; clarification_response intent routes to process_decision_intelligence (N2) so the DI service can update the context with the user's answer and proceed with retrieval. After generating the clarification, routes directly to persist_turn — NOT to evaluate_response (Fix 4: no evidence to evaluate).",
+          "reads_from_state": ["message", "intent", "clarification_question", "user_name", "school_name"],
+          "writes_to_state": ["response_text"],
+          "ports_called": [
+            {
+              "port": "IResponseGenerator",
+              "method": "generate_clarification(message: str, clarification_question: str | None, user_context: dict) → AssistantResponse",
+              "note": "user_context = {user_name: state.user_name or 'there', school_name: state.school_name or 'your school'} built inline by this node. _CLARIFICATION_SYSTEM prompt personalised with both values. If clarification_question is already set from BC-2 gap detection, wrap it into a response. If intent is ambiguous, the LLM generates an appropriate clarification."
+            }
+          ],
+          "domain_methods_called": [],
+          "invariants_enforced": []
+        },
+        {
+          "id": "N5",
+          "name": "evaluate_response",
+          "responsibility": "Computes groundedness_score and relevance_score on the generated response. Determines whether the response meets quality thresholds before delivery. Routing from this node determines whether the turn succeeds or routes to generate_redirect. Only reached for RAG intents (product_inquiry, referral_question, clarification_response) — general_question never reaches this node.",
+          "reads_from_state": ["response_text", "intent", "evidence_chunks"],
+          "writes_to_state": ["groundedness_score", "relevance_score"],
+          "ports_called": [
+            {
+              "port": "IResponseEvaluator",
+              "method": "evaluate(response: AssistantResponse, intent: Intent, evidence: list[str]) → AssistantResponse",
+              "note": "Returns response enriched with groundedness_score and relevance_score. groundedness = claim traceability to evidence; relevance = reverse-question technique."
+            }
+          ],
+          "domain_methods_called": [
+            "AssistantResponse.meets_quality_threshold(min_groundedness, min_relevance) → bool — routing decision"
+          ],
+          "invariants_enforced": [
+            "INV-AR-1 — groundedness_score must reach threshold before response is returned",
+            "INV-AR-5 — response not delivered if either score is below threshold",
+            "INV-AR-6 — relevance_score computed via reverse-question technique",
+            "INV-WF-6 — scores evaluated after generation, before return"
+          ]
+        },
+        {
+          "id": "N6",
+          "name": "persist_turn",
+          "responsibility": "Appends the completed turn to ConversationHistory. Creates two entries: user message entry and assistant response entry. This is the final success node — reached only when response quality passes.",
+          "reads_from_state": ["session_id", "user_id", "message", "intent", "response_text", "turn_number"],
+          "writes_to_state": [],
+          "ports_called": [
+            {
+              "port": "IConversationHistoryRepository",
+              "method": "append(entry: ConversationHistory) → None",
+              "note": "Called twice: once for the user message entry (sender=user), once for the assistant response entry (sender=assistant)"
+            }
+          ],
+          "domain_methods_called": [
+            "ConversationHistory.create(user_id, session_id, message, sender=user) — user entry",
+            "ConversationHistory.create(user_id, session_id, response_text, sender=assistant) — assistant entry"
+          ],
+          "invariants_enforced": [
+            "INV-WF-1 — turn persisted to history on completion"
+          ]
+        },
+        {
+          "id": "N7",
+          "name": "generate_redirect",
+          "responsibility": "Unified redirect node for all no-knowledge-answer situations. Derives redirect_reason from state.intent: 'out_of_scope' when intent is out_of_scope, 'general_question' when intent is general_question (DI bypassed entirely at N1), 'low_quality' when a RAG intent failed the quality gate in evaluate_response. For 'low_quality', the already-retrieved evidence_chunks are passed to the port so the adapter can build a partial, curiosity-driven answer rather than deflecting. Always produces an LLM-generated, personalised response — never a static string. Bypasses the quality gate (scores hardcoded to 1.0). Routes unconditionally to persist_turn.",
+          "reads_from_state": ["message", "intent", "user_name", "school_name", "evidence_chunks", "evidence_type"],
+          "writes_to_state": ["response_text"],
+          "ports_called": [
+            {
+              "port": "IResponseGenerator",
+              "method": "generate_redirect(message: str, conversation_history: list[dict], user_context: dict, redirect_reason: str, evidence: dict | None = None) → AssistantResponse",
+              "note": "redirect_reason one of ['out_of_scope', 'general_question', 'low_quality']. For 'low_quality', evidence = {chunks: state.evidence_chunks, evidence_type: state.evidence_type} is passed so the adapter injects it into _LOW_QUALITY_WITH_EVIDENCE_SYSTEM. For other reasons, evidence=None and _REDIRECT_SYSTEM is used with _REDIRECT_REASON_INSTRUCTIONS. Scores hardcoded to 1.0 — quality gate not applied."
+            }
+          ],
+          "domain_methods_called": [],
+          "invariants_enforced": [
+            "INV-AR-5 — quality-gate failures are handled by redirecting to this node; low-quality responses are never delivered to the caller"
+          ]
+        }
+      ],
+
+      "conditional_edges": [
+        {
+          "from_node": "classify_intent",
+          "routing_field": "intent",
+          "routes": [
+            { "condition": "intent == 'out_of_scope'",                                               "to_node": "generate_redirect", "note": "Bypass DI and retrieval entirely. redirect_reason='out_of_scope'." },
+            { "condition": "intent == 'general_question'",                                           "to_node": "generate_redirect", "note": "No retrieval needed. redirect_reason='general_question'. Conversational engagement response." },
+            { "condition": "intent in ['product_inquiry', 'referral_question', 'clarification_response']", "to_node": "process_decision_intelligence" },
+            { "condition": "intent == 'ambiguous'",                                                  "to_node": "generate_clarification" }
+          ],
+          "routing_logic": "out_of_scope and general_question exit without entering DI, routed to generate_redirect with an appropriate reason. ambiguous asks for clarification. Only product_inquiry, referral_question, and clarification_response enter the full RAG pipeline."
+        },
+        {
+          "from_node": "process_decision_intelligence",
+          "routing_field": "clarification_needed",
+          "routes": [
+            { "condition": "clarification_needed == True",  "to_node": "generate_clarification" },
+            { "condition": "clarification_needed == False", "to_node": "generate_response" }
+          ],
+          "routing_logic": "BC-2 may detect context gaps (GapDetected) and signal clarification is needed. In that case, no evidence is generated and a clarification response replaces the grounded response."
+        },
+        {
+          "from_node": "generate_response",
+          "routing_field": "fixed",
+          "routes": [
+            { "condition": "always", "to_node": "evaluate_response", "note": "generate_response is only reached for RAG intents — evaluate_response is always appropriate." }
+          ]
+        },
+        {
+          "from_node": "generate_clarification",
+          "routing_field": "fixed",
+          "routes": [
+            { "condition": "always", "to_node": "persist_turn", "note": "Clarification response has no evidence to evaluate" }
+          ]
+        },
+        {
+          "from_node": "evaluate_response",
+          "routing_field": "AssistantResponse.meets_quality_threshold()",
+          "routes": [
+            { "condition": "groundedness_score >= threshold AND relevance_score >= threshold", "to_node": "persist_turn",       "note": "INV-AR-1 and INV-AR-6 both satisfied" },
+            { "condition": "groundedness_score < threshold OR relevance_score < threshold",   "to_node": "generate_redirect",  "note": "INV-AR-5: score failure routes to generate_redirect with reason='low_quality'" }
+          ],
+          "thresholds": "Defined as application configuration constants (e.g. MIN_GROUNDEDNESS=0.8, MIN_RELEVANCE=0.75) — not hardcoded in graph"
+        },
+        {
+          "from_node": "generate_redirect",
+          "routing_field": "fixed",
+          "routes": [
+            { "condition": "always", "to_node": "persist_turn" }
+          ]
+        },
+        {
+          "from_node": "persist_turn",
+          "routing_field": "fixed",
+          "routes": [
+            { "condition": "always", "to_node": "END" }
+          ]
+        }
+      ],
+
+      "exit_points": [
+        { "terminal": "END (via persist_turn — direct)",                "meaning": "Turn completed successfully. Response quality gate passed. History persisted." },
+        { "terminal": "END (via generate_redirect → persist_turn)",     "meaning": "No knowledge-grounded answer available. Unified generate_redirect produced an LLM-personalised response (reason: out_of_scope, general_question, or low_quality). History persisted." }
+      ],
+
+      "post_graph_use_case_actions": [
+        "session.complete_turn(intent, response) — transitions active → idle; emits TurnProcessed; increments turn_count",
+        "IConversationSessionRepository.save(session) — persists updated session state",
+        "Drain domain events (TurnProcessed)"
+      ],
+
+      "dependency_injection": {
+        "note": "All port implementations are injected into node functions at graph construction time via closures or partial application.",
+        "injected_ports": [
+          "IIntentClassifier",
+          "IDecisionIntelligenceService",
+          "IResponseGenerator",
+          "IResponseEvaluator",
+          "IConversationHistoryRepository"
+        ],
+        "injected_config": [
+          "MIN_GROUNDEDNESS_THRESHOLD: float",
+          "MIN_RELEVANCE_THRESHOLD: float"
+        ]
+      },
+
+      "langgraph_notes": [
+        "Graph is compiled once at application startup and reused across requests (checkpointer injected at shell/composition level)",
+        "LangGraph checkpointer (SQLite-backed, wired in shell container) enables optional cross-session graph state persistence",
+        "thread_id = session_id — each session has its own LangGraph checkpoint thread"
+      ]
+    },
+
+    {
+      "id": "WF-GRAPH-2",
+      "name": "DecisionIntelligenceSubgraph",
+      "type": "LangGraph StateGraph",
+      "parent_use_case": "ProcessTurnIntelligenceUseCase (UC-5)",
+      "component": "COMP-2",
+      "bounded_context": "BC-2",
+      "bounded_context_name": "decision_intelligence",
+      "module_path": "src/decision_intelligence/application/workflows/decision_intelligence_subgraph.py",
+      "purpose": "Executes the full decision intelligence pipeline inside ProcessTurnIntelligenceUseCase. Extracts preference signals from the user message, updates DecisionContext, evaluates context readiness and gaps, constructs an enriched retrieval query, executes retrieval via COMP-3, and evaluates evidence quality. Includes the retrieval retry cycle when recall falls below threshold. This graph is the application-level process engine for WF1 + WF2/WF3.",
+      "entry_node": "extract_signals",
+
+      "domain_objects_coordinated": [
+        {
+          "object": "DecisionContext",
+          "type": "aggregate_root / process_entity",
+          "how": "Loaded by parent use case before graph invocation. Passed to node functions as an injected dependency (not in graph state). Nodes call domain methods (add_signal, record_gap_evaluation, mark_ready, snapshot, is_ready_for_retrieval, has_gap) directly on the context object. Parent use case saves context after graph returns."
+        },
+        {
+          "object": "RetrievalQuery",
+          "type": "entity",
+          "how": "Created inside construct_retrieval_query node using RetrievalQuery.from_context() factory. Stored as primitives (retrieval_query_text, source_target) in graph state — the entity itself is not persisted."
+        },
+        {
+          "object": "PreferenceSignal",
+          "type": "value_object",
+          "how": "Created by extract_signals node from ISignalExtractor output. Stored as serialized dicts in graph state. Re-hydrated as PreferenceSignal objects in update_decision_context node before calling context.add_signal()."
+        },
+        {
+          "object": "RetrievedEvidence",
+          "type": "value_object",
+          "how": "Created in evaluate_evidence_quality node from IEvidenceEvaluator output. Scores stored as primitives in graph state."
+        }
+      ],
+
+      "graph_state": {
+        "name": "DecisionGraphState",
+        "description": "Typed state schema flowing between DecisionIntelligenceSubgraph nodes. Carries only turn-scoped primitives — no domain objects. DecisionContext is passed to nodes as an injected dependency and is NOT in the graph state.",
+        "fields": [
+          { "name": "session_id",              "type": "str",            "set_by": "use case (initialization)" },
+          { "name": "intent",                  "type": "str",            "set_by": "use case (initialization)", "note": "May be overridden by evaluate_context_readiness node when intent == 'clarification_response' and context.pending_retrieval_intent is set (Fix 2 — resumes original retrieval intent)." },
+          { "name": "message",                 "type": "str",            "set_by": "use case (initialization)" },
+          { "name": "turn_number",             "type": "int",            "set_by": "use case (initialization)" },
+          { "name": "conversation_history",    "type": "list[dict]",    "set_by": "use case (initialization) — forwarded from ProcessTurnIntelligenceCommand; full prior conversation as OpenAI-format messages", "default": [], "note": "Windowed to last _LLM_HISTORY_WINDOW (5) messages by _recent() helper inside the extract_signals node before passing to ISignalExtractor. Provides recent context to the LLM without unbounded token growth." },
+          { "name": "context_snapshot",        "type": "dict",           "set_by": "use case (initialization) via context.snapshot(); updated after update_decision_context node" },
+          { "name": "extracted_signals",       "type": "list[dict]",     "set_by": "extract_signals node", "default": [], "note": "Serialized PreferenceSignal dicts: {key, value, turn_number}" },
+          { "name": "gaps",                    "type": "list[str]",      "set_by": "evaluate_context_readiness node", "default": [] },
+          { "name": "clarification_needed",    "type": "bool",           "set_by": "evaluate_context_readiness node", "default": false },
+          { "name": "clarification_question",  "type": "str | None",     "set_by": "evaluate_context_readiness node" },
+          { "name": "retrieval_query_text",    "type": "str | None",     "set_by": "construct_retrieval_query node" },
+          { "name": "source_target",           "type": "str | None",     "set_by": "construct_retrieval_query node" },
+          { "name": "top_k",                   "type": "int",            "set_by": "construct_retrieval_query node", "default": 5, "note": "Escalates on each retry: _BASE_TOP_K(5) + retrieval_attempts * _TOP_K_INCREMENT(3). Forwarded via RetrievalQueryDTO to ExecuteRetrievalUseCase." },
+          { "name": "evidence_chunks",         "type": "list[str]",      "set_by": "execute_retrieval node", "default": [] },
+          { "name": "evidence_type",           "type": "str | None",     "set_by": "execute_retrieval node" },
+          { "name": "context_recall_score",    "type": "float",          "set_by": "evaluate_evidence_quality node", "default": 0.0 },
+          { "name": "context_precision_score", "type": "float",          "set_by": "evaluate_evidence_quality node", "default": 0.0 },
+          { "name": "retrieval_attempts",      "type": "int",            "set_by": "execute_retrieval node", "default": 0, "note": "Incremented each attempt; bounds the retry cycle (MAX_RETRIEVAL_RETRIES)" },
+          { "name": "context_state",           "type": "str",            "set_by": "update_decision_context node", "note": "Current DecisionContext.status as string" }
+        ]
+      },
+
+      "nodes": [
+        {
+          "id": "N1",
+          "name": "extract_signals",
+          "responsibility": "Extracts preference signals from the current user message. Returns a list of PreferenceSignal primitives that will be added to DecisionContext in the next node.",
+          "reads_from_state": ["message", "turn_number", "conversation_history"],
+          "writes_to_state": ["extracted_signals"],
+          "ports_called": [
+            {
+              "port": "ISignalExtractor",
+              "method": "extract(message: str, turn_number: int, conversation_history: list[dict] | None = None) → list[PreferenceSignal]",
+              "note": "LLM adapter in BC-2 infrastructure. Last _LLM_HISTORY_WINDOW (5) messages of conversation history injected via _recent() helper so the LLM correctly interprets short user answers against recent prior turns."
+            }
+          ],
+          "domain_methods_called": [],
+          "invariants_enforced": [
+            "INV-WF-1 — signal extraction happens before context update and query construction",
+            "INV-WF-4 — this node always runs on every turn entry into this subgraph"
+          ]
+        },
+        {
+          "id": "N2",
+          "name": "update_decision_context",
+          "responsibility": "Applies extracted signals to the DecisionContext aggregate. Each signal is added via context.add_signal() which enforces monotonic accumulation and may trigger state transitions (empty→partial, ready→enriched). Writes updated context_snapshot and context_state to graph state.",
+          "reads_from_state": ["extracted_signals"],
+          "writes_to_state": ["context_snapshot", "context_state"],
+          "ports_called": [],
+          "domain_methods_called": [
+            "PreferenceSignal(key, value, turn_number) — re-hydrate from serialized dict",
+            "context.add_signal(signal) — for each extracted signal; may emit ContextUpdated",
+            "context.snapshot() → dict — capture updated state for graph routing"
+          ],
+          "invariants_enforced": [
+            "INV-DC-5 — signals accumulate monotonically; add_signal never removes (domain-enforced)",
+            "INV-WF-2 — context updated before query construction"
+          ]
+        },
+        {
+          "id": "N3",
+          "name": "evaluate_context_readiness",
+          "responsibility": "Evaluates whether DecisionContext has sufficient signals for retrieval. For intents in _INTENT_SUFFICIENT_RETRIEVAL (currently: referral_question), returns immediately with clarification_needed=False — the user's question text is the sole retrieval signal; no preference signals or context readiness checks apply. This fixes the silent failure where a first-turn referral question produced no evidence because the context was EMPTY and no signals were extracted. For product_inquiry: checks for gaps using _RETRIEVAL_USEFUL_SIGNAL_KEYS; if context is partial and gaps detected, emits GapDetected and prepares a clarification question; if context is sufficient (partial with enough signals or ready/enriched), calls mark_ready() if applicable. For clarification_response intent: checks context.pending_retrieval_intent — if set, may override state intent and resume the original retrieval flow; if cleared, context was already updated and decision whether to retrieve or ask again depends on gap re-check.",
+          "reads_from_state": ["context_snapshot", "intent"],
+          "writes_to_state": ["gaps", "clarification_needed", "clarification_question", "context_state", "intent"],
+          "ports_called": [],
+          "domain_methods_called": [
+            "context.has_gap() → bool — checks if identified_gaps is non-empty",
+            "context.record_gap_evaluation(gaps: list[str]) — updates identified_gaps; conditionally emits GapDetected",
+            "context.mark_ready() — if status == partial and len(signals) > 0 and gaps resolved; emits ContextReady",
+            "context.is_ready_for_retrieval() → bool — returns True if status is ready or enriched (INV-DC-4)",
+            "context.set_pending_retrieval_intent(intent) — saves current retrieval intent before entering clarification loop (Fix 1)",
+            "context.clear_pending_retrieval_intent() — atomically clears saved intent after successful resume (Fix 1, INV-PRI-2)",
+            "context.pending_retrieval_intent → str | None — property; read to detect and resume clarification loop (Fix 2)"
+          ],
+          "clarification_response_resume_logic": "When intent == 'clarification_response': read context.pending_retrieval_intent. If set (a retrieval flow was previously paused), re-check gaps. If gaps now resolved: override state intent to pending_retrieval_intent, clear_pending_retrieval_intent(), route to construct_retrieval_query. If gaps still remain: keep clarification_needed=True, route to END (ask again). If pending_retrieval_intent is None (no prior paused retrieval): route to END with empty evidence.",
+          "gap_evaluation_logic": "Gap evaluation uses _detect_gaps() backed by _RETRIEVAL_USEFUL_SIGNAL_KEYS = {product_category, meal_occasion, dietary_restriction, health_goal, budget_tier}. For product_inquiry: a gap is flagged ONLY when the context contains zero signals from this set. Any single key from the set is sufficient — its value appears verbatim in the Qdrant-enriched product documents and produces a meaningful vector-search query. If at least one retrieval-useful signal is present, no gap is flagged. If none are present, a gap covering all five keys is returned and _build_clarification_question() surfaces an open-ended conversational prompt (not raw key names). For referral_question: the _INTENT_SUFFICIENT_RETRIEVAL bypass is applied — evaluate_context_readiness returns immediately with clarification_needed=False BEFORE gap detection or mark_ready() are called. route_after_readiness also checks _INTENT_SUFFICIENT_RETRIEVAL and routes to construct_retrieval_query regardless of context.is_ready_for_retrieval().",
+          "clarification_question_origin": "When gaps are detected, a clarification question is derived from the gap labels (e.g. gap='product_type' → 'Are you looking for snacks or a breakfast item?'). This can be a rule-based derivation or an ISignalExtractor extension.",
+          "invariants_enforced": [
+            "INV-DC-4 — retrieval only proceeds if intent requires it AND (context is ready/enriched OR intent is in _INTENT_SUFFICIENT_RETRIEVAL)",
+            "INV-DC-6 — mark_ready() guards: must have at least one signal beyond school anchor",
+            "INV-PRI-1 — pending_retrieval_intent only set to retrieval intent values",
+            "INV-PRI-2 — pending_retrieval_intent cleared atomically on successful resume"
+          ]
+        },
+        {
+          "id": "N4",
+          "name": "construct_retrieval_query",
+          "responsibility": "Constructs a RetrievalQuery from the user message, accumulated signal values, classified intent, and (when needed) a substantive prior user message from conversation_history. The user message is the primary semantic source for fresh retrieval intents (product_inquiry, referral_question). Signal values are appended as reinforcement. For clarification_response resumes where the message is a vague answer, signals are used as the primary content instead. School name is excluded from the query — it does not exist in product or referral chunk embeddings. top_k escalates on each retry: _BASE_TOP_K + retrieval_attempts * _TOP_K_INCREMENT (defaults: base=5, increment=3), making each retry a strictly broader search. A vague-message backstop (_MIN_QUERY_CONTENT_WORDS=4) detects when the assembled content is too thin and injects the most recent substantive prior user message from conversation_history to resolve anaphoric references deterministically.",
+          "reads_from_state": ["session_id", "intent", "message", "context_snapshot", "retrieval_attempts", "conversation_history"],
+          "writes_to_state": ["retrieval_query_text", "source_target", "top_k"],
+          "ports_called": [],
+          "domain_methods_called": [
+            "RetrievalQuery.from_context(session_id, query_text, intent, context_status) → RetrievalQuery",
+            "note: query_text = message (primary) + signal values (reinforcement) + [prior user message if vague] + domain anchor label. For clarification resumes: signal values only. School name excluded — not present in Qdrant embeddings. top_k = _BASE_TOP_K + retrieval_attempts * _TOP_K_INCREMENT."
+          ],
+          "query_construction_note": "The user message carries the retrieval vocabulary (e.g. 'eligibility', 'how to refer', 'healthy breakfast'). Signal values add further context. If the combined content word count is below _MIN_QUERY_CONTENT_WORDS (4), the node walks conversation_history in reverse (windowed to _LLM_HISTORY_WINDOW=5) and injects the most recent substantive prior user message (different from current, ≥ _MIN_QUERY_CONTENT_WORDS words) to resolve implicit anaphorical references. The query is assembled deterministically with no extra LLM calls. On retry, top_k escalates so the search window is wider.",
+          "vague_message_backstop": {
+            "constant": "_MIN_QUERY_CONTENT_WORDS = 4",
+            "trigger": "len(message + signal_values combined wordcount) < _MIN_QUERY_CONTENT_WORDS",
+            "action": "Inject most recent prior user message from conversation_history (windowed, reversed scan) that is different from current message and has >= _MIN_QUERY_CONTENT_WORDS words",
+            "rationale": "Anaphorical turns ('ok', 'tell me more', 'and that?') carry no retrieval vocabulary. History injection resolves the implicit reference without an LLM call. Applies to both product_inquiry (when signals are absent) and referral_question (where signals are almost never generated)."
+          },
+          "invariants_enforced": [
+            "INV-RQ-1 — query_text constructed from context snapshot, not raw message",
+            "INV-RQ-2 — source_target derived from intent (product_inquiry → product_catalog; referral_question → referral_program_rules)",
+            "INV-RQ-3 — source_target validated against intent in RetrievalQuery.from_context() factory"
+          ]
+        },
+        {
+          "id": "N5",
+          "name": "execute_retrieval",
+          "responsibility": "Calls IKnowledgeRetrievalService to retrieve evidence from COMP-3 for the constructed query. Increments retrieval_attempts counter (used for retry bound). On retry path, the query_text may be refined before re-entering this node.",
+          "reads_from_state": ["retrieval_query_text", "source_target", "top_k", "retrieval_attempts"],
+          "writes_to_state": ["evidence_chunks", "evidence_type", "retrieval_attempts"],
+          "ports_called": [
+            {
+              "port": "IKnowledgeRetrievalService",
+              "method": "retrieve(dto: RetrievalQueryDTO) → RetrievedEvidenceDTO",
+              "dto_out_fields": ["query_text", "source_target", "top_k"],
+              "dto_in_fields": ["chunks", "evidence_type"],
+              "note": "Cross-context call → KnowledgeRetrievalAdapter (shell) → ExecuteRetrievalUseCase (BC-3). top_k forwarded through DTO → ExecuteRetrievalCommand → repository search()."
+            }
+          ],
+          "domain_methods_called": [],
+          "invariants_enforced": [
+            "INV-WF-3 — retrieval executes before evidence is made available to generation (upstream in BC-1)"
+          ]
+        },
+        {
+          "id": "N6",
+          "name": "evaluate_evidence_quality",
+          "responsibility": "Evaluates the recall and precision of the retrieved evidence against the retrieval query. Determines whether evidence quality is sufficient to proceed toward response generation, or whether a retry with a refined query is needed.",
+          "reads_from_state": ["retrieval_query_text", "source_target", "evidence_chunks", "evidence_type"],
+          "writes_to_state": ["context_recall_score", "context_precision_score"],
+          "ports_called": [
+            {
+              "port": "IEvidenceEvaluator",
+              "method": "evaluate(query: RetrievalQuery, evidence: RetrievedEvidence) → RetrievedEvidence",
+              "note": "Returns evidence enriched with context_recall_score and context_precision_score. Scores stored as primitives in graph state."
+            }
+          ],
+          "domain_methods_called": [
+            "RetrievedEvidence.meets_recall_threshold(min_recall) → bool — routing decision",
+            "RetrievedEvidence.meets_precision_threshold(min_precision) → bool — informational"
+          ],
+          "invariants_enforced": [
+            "INV-RE-1 — context_recall_score computed after every retrieval execution",
+            "INV-RE-2 — context_precision_score computed after every retrieval execution",
+            "INV-WF-5 — evidence quality evaluated before evidence is passed upstream for generation"
+          ]
+        }
+      ],
+
+      "conditional_edges": [
+        {
+          "from_node": "evaluate_context_readiness",
+          "routing_logic": "Routes based on intent type, context readiness, gap detection, and pending_retrieval_intent (clarification resume loop)",
+          "routes": [
+            {
+              "condition": "intent == 'clarification_response' AND context.pending_retrieval_intent is not None AND context.is_ready_for_retrieval() == True",
+              "to_node": "construct_retrieval_query",
+              "note": "Clarification answer resolved all gaps. Resume original retrieval intent. State intent overridden to pending_retrieval_intent; pending_retrieval_intent cleared (Fix 2, INV-PRI-2)."
+            },
+            {
+              "condition": "intent == 'clarification_response' AND context.pending_retrieval_intent is not None AND context.is_ready_for_retrieval() == False",
+              "to_node": "END",
+              "note": "Clarification answer provided but gaps still remain. Ask another clarification question. clarification_needed=True returned to BC-1 (Fix 2 — still in gap-fill loop)."
+            },
+            {
+              "condition": "intent == 'clarification_response' AND context.pending_retrieval_intent is None",
+              "to_node": "END",
+              "note": "No prior retrieval was paused (no pending intent). Return with empty evidence_chunks. BC-1 will generate response from context only."
+            },
+            {
+              "condition": "intent in _INTENT_SUFFICIENT_RETRIEVAL (referral_question)",
+              "to_node": "construct_retrieval_query",
+              "note": "Intent-sufficient bypass: the user's question text is the retrieval signal. No preference signals required. context.is_ready_for_retrieval() check is skipped. route_after_readiness routes directly to construct_retrieval_query regardless of context status (EMPTY, PARTIAL, or READY). Fixes silent failure where first-turn referral questions produced no evidence."
+            },
+            {
+              "condition": "intent in ['product_inquiry', 'referral_question'] AND context.is_ready_for_retrieval() == True",
+              "to_node": "construct_retrieval_query",
+              "note": "INV-DC-4 satisfied: retrieval-path intent + ready/enriched context"
+            },
+            {
+              "condition": "intent in ['product_inquiry', 'referral_question'] AND context.is_ready_for_retrieval() == False AND clarification_needed == True",
+              "to_node": "END",
+              "note": "Context insufficient for retrieval, gap detected. context.set_pending_retrieval_intent(intent) called before returning (Fix 1). Clarification signal returned to BC-1 through TurnIntelligenceResult. No retrieval occurs."
+            },
+            {
+              "condition": "intent == 'general_question'",
+              "to_node": "END",
+              "note": "No retrieval needed. Return with empty evidence_chunks."
+            }
+          ]
+        },
+        {
+          "from_node": "evaluate_evidence_quality",
+          "routing_logic": "Routes based on context_recall_score relative to threshold",
+          "routes": [
+            {
+              "condition": "context_recall_score >= MIN_RECALL_THRESHOLD",
+              "to_node": "END",
+              "note": "INV-RE-3 and INV-RE-4 satisfied. Quality evidence ready to return to BC-1."
+            },
+            {
+              "condition": "context_recall_score < MIN_RECALL_THRESHOLD AND retrieval_attempts < MAX_RETRIEVAL_RETRIES",
+              "to_node": "construct_retrieval_query",
+              "note": "INV-RE-3: recall failed — escalate top_k (+3 per attempt) and retry. Each retry retrieves a strictly broader result set than the previous attempt. MAX_RETRIEVAL_RETRIES=2 (configurable)."
+            },
+            {
+              "condition": "context_recall_score < MIN_RECALL_THRESHOLD AND retrieval_attempts >= MAX_RETRIEVAL_RETRIES",
+              "to_node": "END",
+              "note": "Max retries exhausted. Return degraded evidence with low recall score. BC-1 evaluate_response node will likely route to fallback."
+            }
+          ],
+          "thresholds": "MIN_RECALL_THRESHOLD and MAX_RETRIEVAL_RETRIES defined as application configuration constants"
+        }
+      ],
+
+      "exit_points": [
+        { "terminal": "END (via evaluate_context_readiness — no retrieval)", "meaning": "Intent does not require retrieval. Return with empty evidence. BC-1 will generate response from context only." },
+        { "terminal": "END (via evaluate_context_readiness — clarification)", "meaning": "Context insufficient for retrieval. clarification_needed=True returned to BC-1 to trigger clarification response." },
+        { "terminal": "END (via evaluate_evidence_quality — quality passes)",  "meaning": "Evidence retrieved with sufficient recall. Return evidence to BC-1 for response generation." },
+        { "terminal": "END (via evaluate_evidence_quality — retries exhausted)", "meaning": "Retrieval failed after max retries. Return with degraded evidence. BC-1 response evaluation will likely fall back." }
+      ],
+
+      "post_graph_use_case_actions": [
+        "IDecisionContextRepository.save(context) — persists updated DecisionContext (updated signals, state transitions, gaps)",
+        "Drain domain events (ContextUpdated, GapDetected, ContextReady — intra-component only)"
+      ],
+
+      "dependency_injection": {
+        "note": "DecisionContext is loaded by parent use case and passed to node functions as a captured dependency (not in graph state). Port implementations are injected at graph construction time.",
+        "injected_domain_objects": [
+          "DecisionContext (loaded by use case, passed to nodes as closure dependency)"
+        ],
+        "injected_ports": [
+          "ISignalExtractor",
+          "IEvidenceEvaluator",
+          "IKnowledgeRetrievalService"
+        ],
+        "injected_config": [
+          "MIN_RECALL_THRESHOLD: float",
+          "MAX_RETRIEVAL_RETRIES: int"
+        ]
+      },
+
+      "langgraph_notes": [
+        "This subgraph is invoked by ProcessTurnIntelligenceUseCase, NOT compiled separately — it is assembled as a StateGraph and .invoke()ed directly",
+        "Checkpointer is inherited from the parent TurnGraph if wired through the shell container",
+        "thread_id = session_id — same as TurnGraph"
+      ]
+    }
+
+  ],
+
+  "folder_structure": {
+    "note": "Workflows (LangGraph graph definitions) live in the application/workflows/ subfolder of their bounded context.",
+    "BC-1": {
+      "root": "src/conversation_management/application/workflows/",
+      "files": [
+        "turn_graph.py    — TurnGraph StateGraph definition; compiled and invoked by ProcessTurnUseCase"
+      ]
+    },
+    "BC-2": {
+      "root": "src/decision_intelligence/application/workflows/",
+      "files": [
+        "decision_intelligence_subgraph.py    — DecisionIntelligenceSubgraph StateGraph definition; invoked by ProcessTurnIntelligenceUseCase"
+      ]
+    }
+  },
+
+  "orchestration_summary": {
+    "use_case_to_workflow_mapping": [
+      { "use_case": "UC-1 StartSessionUseCase",             "workflow": "none — sequential imperative flow; no graph needed" },
+      { "use_case": "UC-2 ProcessTurnUseCase",              "workflow": "WF-GRAPH-1 TurnGraph" },
+      { "use_case": "UC-3 CloseSessionUseCase",             "workflow": "none — single domain method call" },
+      { "use_case": "UC-4 PreSeedContextUseCase",           "workflow": "none — single domain creation and save" },
+      { "use_case": "UC-5 ProcessTurnIntelligenceUseCase",  "workflow": "WF-GRAPH-2 DecisionIntelligenceSubgraph" },
+      { "use_case": "UC-6 ExecuteRetrievalUseCase",         "workflow": "none — routing switch with two branches" }
+    ],
+    "rationale": "Only UC-2 and UC-5 require graph orchestration. Both involve multi-step conditional pipelines with branching, quality gates, and retry cycles that would be unmanageable as imperative sequential code. UC-1, UC-3, UC-4, and UC-6 are simple enough to execute imperatively — adding a graph would be over-engineering."
+  }
+}

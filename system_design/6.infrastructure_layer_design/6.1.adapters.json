@@ -1,0 +1,809 @@
+{
+  "system": "Carton Caps Conversational Assistant",
+  "version": "1.0",
+  "phase": "6 — Infrastructure Layer Design",
+  "task": "Adapter Generator",
+  "derived_from": [
+    "use_cases.json",
+    "context_coordination.json",
+    "workflow_orchestration.json",
+    "domain_model.json",
+    "layered_architecture.json",
+    "phase_6_task_analysis.md",
+    "repositories.json"
+  ],
+
+  "design_principles": [
+    "Adapters implement ports — they translate between domain/application contracts and external technology",
+    "No domain logic lives in adapters — all invariant enforcement stays in domain objects",
+    "Each adapter depends on its bounded context's application or domain layer — never the reverse",
+    "Cross-context adapters (DecisionIntelligenceAdapter, KnowledgeRetrievalAdapter) were built in Phase 5 — not rebuilt here",
+    "Qdrant replaces ChromaDB for all vector store operations (both ingestion write and runtime read)",
+    "SQLite is used for all structured relational data — users, schools, purchase history, conversation history, and RAG metrics",
+    "In-memory implementations are used only for session-scoped state that does not need to survive restarts; conversation history is persisted in SQLite",
+    "Observability is implemented as a first-class adapter: every turn's RAG evaluation metrics are persisted to SQLite for analysis",
+    "Domain events emitted by aggregates are published via LoggingEventPublisher at every use-case boundary — events are no longer fire-and-forget",
+    "OpenAI adapters use structured JSON response mode where parsing determinism is required",
+    "OpenAI API constraint: when response_format={\"type\": \"json_object\"} is used, at least one message in the request (system or user) must contain the literal word 'json' — OpenAI returns HTTP 400 if this word is absent. All JSON-mode adapters must include the word 'json' explicitly in their system prompt's final instruction line.",
+    "Prompt construction is the sole responsibility of the LLM adapter — no prompt text exists in use cases or domain"
+  ],
+
+  "technology_choices": {
+    "vector_store": {
+      "technology": "Qdrant",
+      "client": "qdrant-client",
+      "embedding_model": "text-embedding-3-small (OpenAI)",
+      "collections": ["product_catalog", "referral_program_rules"],
+      "rationale": "Qdrant is a purpose-built vector database with a Python client, cosine similarity support, and payload filtering. Replaces ChromaDB across both ingestion write side and runtime read side for consistency."
+    },
+    "relational_data": {
+      "technology": "SQLite",
+      "client": "sqlite3 (stdlib)",
+      "databases": {
+        "carton_caps_data.sqlite": "Existing DB — source of truth for Users, Schools, Products, Purchase_History, and Conversation_History",
+        "rag_metrics.sqlite": "New DB — RAG evaluation metrics log written every turn for observability"
+      },
+      "rationale": "SQLite is zero-setup, already present in the project, and adequate for a prototype. The existing carton_caps_data.sqlite carries the domain fixture data. A separate rag_metrics.sqlite isolates observability data from domain data."
+    },
+    "session_memory": {
+      "technology": "Python dict (in-process)",
+      "rationale": "Session and context state is turn-scoped and does not need to survive process restarts in the prototype. In-memory is the fastest and simplest implementation."
+    },
+    "llm_service": {
+      "technology": "OpenAI Chat Completions API",
+      "client": "openai (Python SDK)",
+      "models": {
+        "intent_classification": "gpt-4o-mini",
+        "signal_extraction": "gpt-4o-mini",
+        "response_generation": "gpt-4o",
+        "response_evaluation": "gpt-4o-mini",
+        "evidence_evaluation": "gpt-4o-mini"
+      },
+      "rationale": "gpt-4o-mini for classification and evaluation tasks (fast, cheap, structured output). gpt-4o for response generation (quality matters most here)."
+    }
+  },
+
+  "new_application_port": {
+    "id": "PORT-OBS-1",
+    "name": "IRAGMetricsLogger",
+    "bounded_context": "BC-1",
+    "module_path": "src/conversation_management/application/ports/i_rag_metrics_logger.py",
+    "purpose": "Application-layer port for persisting RAG evaluation metrics per conversation turn. Called by ProcessTurnUseCase after TurnGraph completes. Enables operational observability of the RAG pipeline without coupling domain logic to infrastructure.",
+    "method": "log_turn_metrics(metrics: TurnMetricsDTO) -> None",
+    "dto": {
+      "name": "TurnMetricsDTO",
+      "fields": [
+        "session_id: str",
+        "turn_number: int",
+        "intent: str",
+        "context_state: str",
+        "context_recall_score: float",
+        "context_precision_score: float",
+        "groundedness_score: float",
+        "relevance_score: float",
+        "is_fallback: bool",
+        "clarification_needed: bool",
+        "evidence_chunk_count: int",
+        "timestamp: str (ISO 8601)"
+      ]
+    }
+  },
+
+  "adapters": [
+
+    {
+      "id": "ADAPT-1",
+      "name": "QdrantVectorStoreWriter",
+      "type": "vector_store_write_adapter",
+      "port": "IVectorStoreWriter",
+      "bounded_context": "Ingestion Pipeline",
+      "component": "src/ingestion",
+      "module_path": "src/ingestion/infrastructure/vector_store/qdrant_writer.py",
+      "replaces": "ChromaVectorStoreWriter (src/ingestion/infrastructure/vector_store/chroma_writer.py)",
+      "technology": "qdrant-client + OpenAI text-embedding-3-small",
+      "purpose": "Writes ingestion documents to Qdrant during the offline ingestion pipeline. Generates embeddings via OpenAI, then upserts points into named Qdrant collections. This is the write counterpart to ADAPT-7 and ADAPT-8.",
+      "responsibilities": [
+        "Generate embeddings for a batch of IngestionDocument objects via OpenAI embeddings API",
+        "Upsert points into a named Qdrant collection (product_catalog or referral_program_rules)",
+        "Delete and recreate the collection on clear_collection() for idempotent re-ingestion",
+        "Batch API calls to stay within OpenAI and Qdrant payload limits"
+      ],
+      "dependencies": ["openai.OpenAI client", "qdrant_client.QdrantClient"],
+      "constructor_params": [
+        "qdrant_url: str (default localhost:6333)",
+        "openai_client: OpenAI",
+        "collection_vector_size: int = 1536"
+      ],
+      "methods": [
+        {
+          "signature": "write_batch(collection_name: str, documents: list[IngestionDocument]) -> None",
+          "logic": "Embed document texts in batches of 500 via OpenAI. Upsert PointStruct objects to Qdrant: id=hash(doc.id), vector=embedding, payload={text, metadata}."
+        },
+        {
+          "signature": "clear_collection(collection_name: str) -> None",
+          "logic": "Delete the Qdrant collection if it exists, then recreate it with cosine distance and vector_size=1536. Ensures idempotent re-ingestion."
+        }
+      ]
+    },
+
+    {
+      "id": "ADAPT-2",
+      "name": "OpenAIIntentClassifier",
+      "type": "llm_adapter",
+      "port": "IIntentClassifier",
+      "bounded_context": "BC-1",
+      "bounded_context_name": "conversation_management",
+      "component": "COMP-1",
+      "module_path": "src/conversation_management/infrastructure/llm/openai_intent_classifier.py",
+      "technology": "OpenAI chat completions API (gpt-4o-mini, JSON mode)",
+      "purpose": "Classifies a user message into one of six IntentType values. Called by the classify_intent node in TurnGraph. Returns an Intent value object.",
+      "responsibilities": [
+        "Construct a classification prompt containing the six valid intent labels and their descriptions",
+        "Call OpenAI with JSON response mode to guarantee a parseable intent string",
+        "Map the returned string to IntentType enum; fall back to AMBIGUOUS on unrecognized values",
+        "Return Intent(value=IntentType.X)"
+      ],
+      "dependencies": ["openai.OpenAI client"],
+      "constructor_params": [
+        "openai_client: OpenAI",
+        "model: str = 'gpt-4o-mini'"
+      ],
+      "methods": [
+        {
+          "signature": "classify(message: str) -> Intent",
+          "logic": "POST to OpenAI with system prompt defining the 6 intent categories (product_inquiry, referral_question, general_question, clarification_response, ambiguous, out_of_scope) and the user message. Parse JSON response {\"intent\": \"<value>\"}. Map to IntentType. Return Intent(value=mapped_type)."
+        }
+      ],
+      "prompt_strategy": "System prompt defines the Carton Caps context (grocery shopping assistant, school fundraising app) and the six intent labels with clear decision rules. One-shot examples included for product_inquiry vs referral_question disambiguation. Final instruction line explicitly includes the word 'JSON' to satisfy the OpenAI json_object constraint: 'Respond with a JSON object in exactly this format: {\"intent\": \"<label>\"}'.",
+      "invariants": ["INV-WF-1 — intent classified before context update and retrieval"]
+    },
+
+    {
+      "id": "ADAPT-3",
+      "name": "OpenAIResponseGenerator",
+      "type": "llm_adapter",
+      "port": "IResponseGenerator",
+      "bounded_context": "BC-1",
+      "bounded_context_name": "conversation_management",
+      "component": "COMP-1",
+      "module_path": "src/conversation_management/infrastructure/llm/openai_response_generator.py",
+      "technology": "OpenAI chat completions API (gpt-4o)",
+      "purpose": "Generates grounded assistant responses from retrieved evidence and DecisionContext snapshot. Also generates clarification and unified redirect responses (out_of_scope, general_question, and quality failure). Personalises all response types with the user's name and school name. Never invents product or referral facts beyond the provided evidence.",
+      "responsibilities": [
+        "Construct a generation prompt that injects evidence chunks and context snapshot as grounding material",
+        "Instruct the LLM to cite only the provided evidence and not hallucinate product or referral facts",
+        "Return AssistantResponse with text, intent_answered, groundedness_score=0.0 (scores filled by IResponseEvaluator after this call), and extracted source IDs from evidence",
+        "Personalise system prompt in generate(), generate_clarification(), and generate_redirect() using user_name and school_name",
+        "Adapt redirect tone based on redirect_reason parameter: 'out_of_scope' (polite domain redirect), 'general_question' (warm conversational engagement), 'low_quality' (inject retrieved evidence chunks into a dedicated prompt that forbids deflection, requires a partial answer from the available signal, and ends with one focused follow-up question to deepen understanding)"
+      ],
+      "dependencies": ["openai.OpenAI client"],
+      "constructor_params": [
+        "openai_client: OpenAI",
+        "model: str = 'gpt-4o'"
+      ],
+      "methods": [
+        {
+          "signature": "generate(message: str, evidence: dict, context_snapshot: dict) -> AssistantResponse",
+          "logic": "Extract user_name (default 'there') and school_name (default 'your school') from context_snapshot. Format _SYSTEM_PROMPT_TEMPLATE with both values. Build system prompt with injected evidence chunks. User turn contains the original message. Call OpenAI. Parse response text. Extract source_ids from evidence metadata. Return AssistantResponse.create() with groundedness_score=0.0 and relevance_score=0.0."
+        },
+        {
+          "signature": "generate_clarification(message: str, clarification_question: str, user_context: dict) -> AssistantResponse",
+          "logic": "Extract user_name and school_name from user_context dict (fallback defaults applied). Format _CLARIFICATION_SYSTEM template with both values. Wrap clarification_question into a friendly conversational form. Return AssistantResponse with is_fallback=False and placeholder scores (0.0). Clarification responses bypass the quality gate."
+        },
+        {
+          "signature": "generate_redirect(message: str, conversation_history: list[dict], user_context: dict, redirect_reason: str, evidence: dict | None = None) -> AssistantResponse",
+          "logic": "Extract user_name and school_name from user_context dict (fallback defaults applied). Branch on redirect_reason: (1) If 'low_quality' and evidence contains non-empty chunks — format _LOW_QUALITY_WITH_EVIDENCE_SYSTEM with user_name, school_name, and a numbered evidence_text list; this prompt forbids deflection phrases, instructs the LLM to use the partial evidence to answer, and requires exactly one follow-up question at the end. (2) If 'low_quality' with no chunks, or any other reason — look up reason-specific instruction from _REDIRECT_REASON_INSTRUCTIONS and format _REDIRECT_SYSTEM. Append conversation_history and user message. Call OpenAI. Determine intent_answered: OUT_OF_SCOPE for 'out_of_scope', GENERAL_QUESTION for 'general_question' and 'low_quality'. Return AssistantResponse.create() with scores hardcoded to 1.0 (quality gate is not applied to redirect responses)."
+        }
+      ],
+      "prompt_strategy": "Each method uses a distinct personalised system prompt template. generate(): grounding prompt with evidence chunks, instructs LLM to cite only retrieved facts. generate_clarification(): warm tone, wraps clarification_question into a friendly message. generate_redirect(): splits on redirect_reason — for 'out_of_scope' and 'general_question', uses the shared _REDIRECT_SYSTEM template with a reason-specific instruction injected from _REDIRECT_REASON_INSTRUCTIONS; for 'low_quality' with available chunks, uses the dedicated _LOW_QUALITY_WITH_EVIDENCE_SYSTEM template which injects the evidence as a numbered list and strictly prohibits deflection ('never say you have no information'), instructing the LLM to provide a partial answer and close with exactly one focused follow-up question.",
+      "invariants": [
+        "INV-AR-2 — product recommendations cite only retrieved products",
+        "INV-AR-3 — referral guidance derived exclusively from retrieved rules",
+        "INV-AR-4 — school reference injected from context snapshot"
+      ]
+    },
+
+    {
+      "id": "ADAPT-4",
+      "name": "OpenAIResponseEvaluator",
+      "type": "llm_adapter",
+      "port": "IResponseEvaluator",
+      "bounded_context": "BC-1",
+      "bounded_context_name": "conversation_management",
+      "component": "COMP-1",
+      "module_path": "src/conversation_management/infrastructure/llm/openai_response_evaluator.py",
+      "technology": "OpenAI chat completions API (gpt-4o-mini, JSON mode)",
+      "purpose": "Computes groundedness_score and relevance_score on a generated AssistantResponse. Uses the reverse-question technique for relevance scoring. Returns a new immutable AssistantResponse with both scores populated.",
+      "responsibilities": [
+        "Evaluate groundedness: for each claim in the response text, check whether it is traceable to a chunk in the evidence. Produce a score in [0.0, 1.0].",
+        "Evaluate relevance (reverse-question technique): ask the LLM 'what question does this response answer?' and compare to the original user message. Score alignment in [0.0, 1.0].",
+        "Return AssistantResponse with updated groundedness_score and relevance_score"
+      ],
+      "dependencies": ["openai.OpenAI client"],
+      "constructor_params": [
+        "openai_client: OpenAI",
+        "model: str = 'gpt-4o-mini'"
+      ],
+      "methods": [
+        {
+          "signature": "evaluate(response: AssistantResponse, intent: Intent, evidence: dict) -> AssistantResponse",
+          "logic": "Single OpenAI call with JSON mode. Prompt presents: (1) evidence chunks, (2) the generated response, (3) the original user intent. Asks for {\"groundedness_score\": 0.0-1.0, \"relevance_score\": 0.0-1.0, \"reasoning\": \"...\"}. Clamp scores to [0.0, 1.0]. Return a new AssistantResponse with updated scores via dataclasses.replace()."
+        }
+      ],
+      "prompt_strategy": "Groundedness rubric: 0.0=all claims hallucinated, 1.0=all claims directly traceable to evidence. Relevance rubric: 0.0=response answers a completely different question, 1.0=response precisely answers the user's classified intent. Include reasoning field for debugging. Final instruction line explicitly includes the word 'JSON' to satisfy the OpenAI json_object constraint: 'Return only a valid JSON object.'",
+      "invariants": [
+        "INV-AR-1 — groundedness_score must reach threshold before response is delivered",
+        "INV-AR-5 — quality failure triggers safe fallback, not raw response",
+        "INV-AR-6 — relevance_score via reverse-question technique"
+      ]
+    },
+
+    {
+      "id": "ADAPT-5",
+      "name": "OpenAISignalExtractor",
+      "type": "llm_adapter",
+      "port": "ISignalExtractor",
+      "bounded_context": "BC-2",
+      "bounded_context_name": "decision_intelligence",
+      "component": "COMP-2",
+      "module_path": "src/decision_intelligence/infrastructure/llm/openai_signal_extractor.py",
+      "technology": "OpenAI chat completions API (gpt-4o-mini, JSON mode)",
+      "purpose": "Extracts structured preference signals from a free-text user message. Called by the extract_signals node in DecisionIntelligenceSubgraph. Returns a list of PreferenceSignal value objects.",
+      "responsibilities": [
+        "Identify key-value preference pairs from the user message (e.g., dietary_restriction=gluten-free, budget=low, occasion=breakfast)",
+        "Return an empty list when no preference signals are present",
+        "Tag each signal with the current turn_number for monotonic accumulation in DecisionContext"
+      ],
+      "dependencies": ["openai.OpenAI client"],
+      "constructor_params": [
+        "openai_client: OpenAI",
+        "model: str = 'gpt-4o-mini'"
+      ],
+      "methods": [
+        {
+          "signature": "extract(message: str, turn_number: int, conversation_history: list[dict] | None = None) -> list[PreferenceSignal]",
+          "logic": "Call OpenAI with JSON mode. Build messages as [system_prompt] + last _LLM_HISTORY_WINDOW (5) messages of conversation_history + [current_user_message] so the LLM sees recent conversational context when extracting signals. Prompt instructs: extract shopping preference signals as key-value pairs. Response format: {\"signals\": [{\"key\": \"...\", \"value\": \"...\"}]}. Map each dict to PreferenceSignal(key=..., value=..., turn_number=turn_number). Return empty list if signals array is empty."
+        }
+      ],
+      "prompt_strategy": "System prompt frames the task as a Carton Caps school fundraising assistant that recommends everyday grocery products (cereal, snacks, oatmeal, mac & cheese, pasta, rice, canned vegetables, trail mix, etc.). Exactly five valid signal keys are emitted: product_category, meal_occasion, dietary_restriction, health_goal, budget_tier. Keys removed from earlier designs (brand_preference, family_size, age_group) were dropped because they do not appear in the enriched product documents stored in Qdrant and therefore do not improve retrieval. Instructs the LLM to extract only what is explicitly stated or clearly implied — no inference beyond the message. Only keys from the five valid keys are emitted. Final instruction line explicitly includes the word 'JSON' to satisfy the OpenAI json_object constraint: 'Respond with a JSON object in exactly this format: {\"signals\": [...]}'.",
+      "invariants": ["INV-DC-5 — each signal is assigned turn_number for monotonic tracing"]
+    },
+
+    {
+      "id": "ADAPT-6",
+      "name": "OpenAIEvidenceEvaluator",
+      "type": "llm_adapter",
+      "port": "IEvidenceEvaluator",
+      "bounded_context": "BC-2",
+      "bounded_context_name": "decision_intelligence",
+      "component": "COMP-2",
+      "module_path": "src/decision_intelligence/infrastructure/llm/openai_evidence_evaluator.py",
+      "technology": "OpenAI chat completions API (gpt-4o-mini, JSON mode)",
+      "purpose": "Scores retrieved evidence for context recall (coverage) and context precision (relevance) against the retrieval query. Returns an updated RetrievedEvidence with scores populated. These scores drive the retry cycle in DecisionIntelligenceSubgraph.",
+      "responsibilities": [
+        "Evaluate context_recall_score: does the retrieved evidence cover the full scope of the query? (0.0=no relevant chunks, 1.0=complete coverage)",
+        "Evaluate context_precision_score: are the retrieved chunks tightly relevant? (0.0=all noise, 1.0=all chunks directly relevant)",
+        "Return a new immutable RetrievedEvidence with updated scores"
+      ],
+      "dependencies": ["openai.OpenAI client"],
+      "constructor_params": [
+        "openai_client: OpenAI",
+        "model: str = 'gpt-4o-mini'"
+      ],
+      "methods": [
+        {
+          "signature": "evaluate(query: RetrievalQuery, evidence: RetrievedEvidence) -> RetrievedEvidence",
+          "logic": "Single OpenAI call with JSON mode. Prompt presents: (1) the retrieval query text, (2) the retrieved chunks (as a numbered list). Ask for {\"context_recall_score\": 0.0-1.0, \"context_precision_score\": 0.0-1.0}. Clamp scores. Return RetrievedEvidence.create() with same chunks and updated scores."
+        }
+      ],
+      "prompt_strategy": "Recall rubric: 0.0=none of the query's information needs are covered, 1.0=all information needs are covered by at least one chunk. Precision rubric: 0.0=all chunks are noise unrelated to the query, 1.0=every chunk directly supports answering the query. Final instruction line explicitly includes the word 'JSON' to satisfy the OpenAI json_object constraint: 'Return only a valid JSON object.'",
+      "invariants": [
+        "INV-RE-1 — context_recall_score computed after retrieval, before injection into generation",
+        "INV-RE-2 — context_precision_score computed after retrieval, before injection",
+        "INV-RE-3 — if recall < threshold, retry cycle activates (graph routing, not adapter logic)"
+      ]
+    },
+
+    {
+      "id": "ADAPT-7",
+      "name": "QdrantProductRepository",
+      "type": "vector_store_read_adapter",
+      "port": "IProductRepository",
+      "repository_id": "REPO-7",
+      "bounded_context": "BC-3",
+      "bounded_context_name": "knowledge_retrieval",
+      "component": "COMP-3",
+      "module_path": "src/knowledge_retrieval/infrastructure/repositories/qdrant_product_repository.py",
+      "technology": "qdrant-client + OpenAI text-embedding-3-small",
+      "purpose": "Semantic search over the product_catalog Qdrant collection. Queries are embedded via OpenAI and searched against the collection written by QdrantVectorStoreWriter during ingestion.",
+      "responsibilities": [
+        "Embed the query_text using the same model and client as the ingestion write side (text-embedding-3-small)",
+        "Execute a Qdrant nearest-neighbor search on the product_catalog collection",
+        "Map retrieved Qdrant points to Product domain entities",
+        "Return up to top_k Product objects ordered by relevance score"
+      ],
+      "dependencies": ["openai.OpenAI client", "qdrant_client.QdrantClient"],
+      "constructor_params": [
+        "qdrant_url: str",
+        "openai_client: OpenAI",
+        "collection_name: str = 'product_catalog'",
+        "qdrant_api_key: str | None = None — passed to QdrantClient for Qdrant Cloud authentication"
+      ],
+      "methods": [
+        {
+          "signature": "search(query_text: str, top_k: int) -> list[Product]",
+          "logic": "Embed query_text with OpenAI text-embedding-3-small. Call qdrant_client.query_points(collection_name=..., query=embedding, limit=top_k, with_payload=True).points. Map each ScoredPoint to Product(product_id=payload['product_id'], name=payload['name'], category=payload.get('category',''), brand=payload.get('brand',''), description=point.payload.get('text',''), attributes={}). Return list."
+        }
+      ],
+      "collection_contract": "The product_catalog collection is populated by QdrantVectorStoreWriter during ingestion. Points have payload: {product_id, name, price, text (enriched description)}. The source Products table has no category column — category is not present in the payload; the field is kept on the domain entity but is not validated.",
+      "invariants": ["INV-AR-2 — only retrieved products reach the response generator"]
+    },
+
+    {
+      "id": "ADAPT-8",
+      "name": "QdrantReferralRuleRepository",
+      "type": "vector_store_read_adapter",
+      "port": "IReferralRuleRepository",
+      "repository_id": "REPO-8",
+      "bounded_context": "BC-3",
+      "bounded_context_name": "knowledge_retrieval",
+      "component": "COMP-3",
+      "module_path": "src/knowledge_retrieval/infrastructure/repositories/qdrant_referral_rule_repository.py",
+      "technology": "qdrant-client + OpenAI text-embedding-3-small",
+      "purpose": "Semantic search over the referral_program_rules Qdrant collection. Mirror of QdrantProductRepository for the referral rules knowledge source.",
+      "responsibilities": [
+        "Embed the query_text via OpenAI",
+        "Execute nearest-neighbor search on referral_program_rules collection",
+        "Map Qdrant points to ReferralRule domain entities using point payload",
+        "Return up to top_k ReferralRule objects"
+      ],
+      "dependencies": ["openai.OpenAI client", "qdrant_client.QdrantClient"],
+      "constructor_params": [
+        "qdrant_url: str",
+        "openai_client: OpenAI",
+        "collection_name: str = 'referral_program_rules'",
+        "qdrant_api_key: str | None = None — passed to QdrantClient for Qdrant Cloud authentication"
+      ],
+      "methods": [
+        {
+          "signature": "search(query_text: str, top_k: int) -> list[ReferralRule]",
+          "logic": "Embed query_text. Call qdrant_client.query_points(collection_name=..., query=embedding, limit=top_k, with_payload=True).points on referral_program_rules collection. Map each ScoredPoint to ReferralRule(rule_id=point.id, title=payload.get('label', 'rule'), description=payload['text'], rule_type=RuleType.ELIGIBILITY as default). Return list."
+        }
+      ],
+      "collection_contract": "The referral_program_rules collection is populated by QdrantVectorStoreWriter during ingestion. Points have payload: {source_file, chunk_id, label, source, text}. The label field maps to ReferralRule.title.",
+      "invariants": ["INV-AR-3 — only retrieved referral rules reach the response generator"]
+    },
+
+    {
+      "id": "ADAPT-9",
+      "name": "InMemoryConversationSessionRepository",
+      "type": "in_memory_repository_adapter",
+      "port": "IConversationSessionRepository",
+      "repository_id": "REPO-1",
+      "bounded_context": "BC-1",
+      "bounded_context_name": "conversation_management",
+      "component": "COMP-1",
+      "module_path": "src/conversation_management/infrastructure/repositories/in_memory_conversation_session_repository.py",
+      "technology": "Python dict (in-process)",
+      "purpose": "Persists ConversationSession aggregates in a dict keyed by session_id. Adequate for prototype — sessions do not need to survive process restarts.",
+      "responsibilities": [
+        "Store sessions by session_id",
+        "Retrieve a session by session_id",
+        "Retrieve the single active/idle session for a user_id"
+      ],
+      "dependencies": [],
+      "constructor_params": [],
+      "methods": [
+        {
+          "signature": "save(session: ConversationSession) -> None",
+          "logic": "self._sessions[session.session_id] = session"
+        },
+        {
+          "signature": "find_by_id(session_id: str) -> Optional[ConversationSession]",
+          "logic": "return self._sessions.get(session_id)"
+        },
+        {
+          "signature": "find_active_by_user_id(user_id: str) -> Optional[ConversationSession]",
+          "logic": "Search all values for status in (ACTIVE, IDLE) and user_id match. Return first match or None."
+        }
+      ]
+    },
+
+    {
+      "id": "ADAPT-10",
+      "name": "InMemoryConversationHistoryRepository",
+      "type": "in_memory_repository_adapter",
+      "port": "IConversationHistoryRepository",
+      "repository_id": "REPO-2",
+      "bounded_context": "BC-1",
+      "bounded_context_name": "conversation_management",
+      "component": "COMP-1",
+      "module_path": "src/conversation_management/infrastructure/repositories/in_memory_conversation_history_repository.py",
+      "technology": "Python list + dict (in-process)",
+      "purpose": "Stores ConversationHistory records in memory, grouped by user_id. Legacy prototype adapter kept for experiments and tests, but not wired by default in the runtime container.",
+      "note": "The runtime container now uses SQLiteConversationHistoryRepository against the Conversation_History table. This in-memory implementation remains available as an alternate non-durable adapter.",
+      "responsibilities": [
+        "Append a new ConversationHistory record",
+        "Retrieve all records for a given user_id in chronological order"
+      ],
+      "dependencies": [],
+      "constructor_params": [],
+      "methods": [
+        {
+          "signature": "append(entry: ConversationHistory) -> None",
+          "logic": "Append to self._records[entry.user_id] list (defaultdict)."
+        },
+        {
+          "signature": "find_by_user_id(user_id: str) -> list[ConversationHistory]",
+          "logic": "return list(self._records.get(user_id, []))"
+        }
+      ]
+    },
+
+    {
+      "id": "ADAPT-16",
+      "name": "SQLiteConversationHistoryRepository",
+      "type": "sqlite_repository_adapter",
+      "port": "IConversationHistoryRepository",
+      "repository_id": "REPO-2",
+      "bounded_context": "BC-1",
+      "bounded_context_name": "conversation_management",
+      "component": "COMP-1",
+      "module_path": "src/conversation_management/infrastructure/repositories/sqlite_conversation_history_repository.py",
+      "technology": "sqlite3 (stdlib)",
+      "purpose": "Persists ConversationHistory records to the existing carton_caps_data.sqlite Conversation_History table and reads them back in chronological order. This is the default runtime adapter used by the shell composition root.",
+      "db_table": "Conversation_History (legacy rows plus optional history_id and session_id columns added by adapter migration)",
+      "responsibilities": [
+        "Append a new ConversationHistory record into SQLite",
+        "Read all records for a given user_id in chronological order",
+        "Add optional history_id and session_id columns on first use when missing",
+        "Map legacy sender values such as bot to SenderType.ASSISTANT"
+      ],
+      "dependencies": ["sqlite3 (stdlib)", "db_path: str config"],
+      "constructor_params": ["db_path: str"],
+      "methods": [
+        {
+          "signature": "append(entry: ConversationHistory) -> None",
+          "logic": "INSERT INTO Conversation_History (history_id, user_id, session_id, message, sender, timestamp) VALUES (?, ?, ?, ?, ?, ?). Timestamp is stored as ISO 8601."
+        },
+        {
+          "signature": "find_by_user_id(user_id: str) -> list[ConversationHistory]",
+          "logic": "SELECT id, history_id, user_id, session_id, message, sender, timestamp FROM Conversation_History WHERE user_id = ? ORDER BY timestamp ASC. Map rows back to ConversationHistory entities."
+        }
+      ]
+    },
+
+    {
+      "id": "ADAPT-17",
+      "name": "LoggingEventPublisher",
+      "type": "observability_adapter",
+      "port": "IEventPublisher (BC-1 and BC-2)",
+      "bounded_context": "shell",
+      "bounded_context_name": "shell/composition",
+      "component": "shell layer",
+      "module_path": "src/shell/composition/logging_event_publisher.py",
+      "technology": "logging (Python stdlib)",
+      "purpose": "Publishes domain events emitted by ConversationSession and DecisionContext aggregates as structured INFO-level log records into a dedicated file. Single instance satisfies both BC-1 and BC-2 IEventPublisher ports via multiple inheritance. Placed in the shell layer — the only location permitted to import from both bounded contexts simultaneously.",
+      "logger_name": "carton_caps.domain_events",
+      "default_log_file": "data/domain_events.log",
+      "config_env_var": "DOMAIN_EVENT_LOG_PATH",
+      "log_format": "%(asctime)s %(levelname)s %(name)s [DomainEvent] <EventType> <field>=<value> ...",
+      "responsibilities": [
+        "Publish all events drained from ConversationSession.collect_events() in StartSessionUseCase, ProcessTurnUseCase, and CloseSessionUseCase",
+        "Publish all events drained from DecisionContext.collect_events() in ProcessTurnIntelligenceUseCase",
+        "Create the parent directory for the log file when missing",
+        "Attach a single FileHandler per configured path to avoid duplicated log lines across repeated container builds",
+        "Log each event at INFO level with the event type name and all dataclass fields as key=value pairs",
+        "Never raise — log failures are silently swallowed so they cannot interrupt the turn pipeline"
+      ],
+      "published_events": [
+        "SessionStarted  (BC-1) — session_id, user_id, school_id, occurred_at",
+        "TurnProcessed   (BC-1) — session_id, turn_count, intent_value, occurred_at",
+        "SessionClosed   (BC-1) — session_id, user_id, occurred_at",
+        "ContextUpdated  (BC-2) — session_id, context_state, signal_count, occurred_at",
+        "GapDetected     (BC-2) — session_id, gaps, occurred_at",
+        "ContextReady    (BC-2) — session_id, signal_count, occurred_at"
+      ],
+      "dependencies": ["logging (stdlib)", "dataclasses (stdlib)", "pathlib (stdlib)"],
+      "constructor_params": ["log_path: str"],
+      "methods": [
+        {
+          "signature": "__init__(log_path: str) -> None",
+          "logic": "Configure a FileHandler targeting log_path (default from DOMAIN_EVENT_LOG_PATH or data/domain_events.log). Create parent directory if needed. Reuse an existing handler when the same resolved path is already attached to the logger."
+        },
+        {
+          "signature": "publish(events: list) -> None",
+          "logic": "For each event: resolve type name, call dataclasses.asdict(), format fields as key=value string, emit _logger.info('[DomainEvent] %s %s', event_type, fields). Wrapped in try/except to guarantee no propagating errors."
+        }
+      ]
+    },
+
+    {
+      "id": "ADAPT-11",
+      "name": "SQLiteUserRepository",
+      "type": "sqlite_read_adapter",
+      "port": "IUserRepository",
+      "repository_id": "REPO-3",
+      "bounded_context": "BC-1",
+      "bounded_context_name": "conversation_management",
+      "component": "COMP-1",
+      "module_path": "src/conversation_management/infrastructure/repositories/sqlite_user_repository.py",
+      "technology": "sqlite3 (stdlib)",
+      "purpose": "Reads User identity from the existing carton_caps_data.sqlite Users table. Read-only — identity is pre-resolved, never mutated by this service.",
+      "db_table": "Users (id, school_id, name, email, created_at)",
+      "responsibilities": [
+        "Query the Users table by id",
+        "Map row to User(user_id=str(id), school_id=str(school_id))",
+        "Return None if not found"
+      ],
+      "dependencies": ["sqlite3 (stdlib)", "db_path: str config"],
+      "constructor_params": ["db_path: str"],
+      "methods": [
+        {
+          "signature": "find_by_id(user_id: str) -> Optional[User]",
+          "logic": "Execute SELECT id, school_id FROM Users WHERE id = ? with user_id cast to int. Return User(user_id=str(row.id), school_id=str(row.school_id)) or None."
+        }
+      ]
+    },
+
+    {
+      "id": "ADAPT-12",
+      "name": "SQLiteSchoolRepository",
+      "type": "sqlite_read_adapter",
+      "port": "ISchoolRepository",
+      "repository_id": "REPO-4",
+      "bounded_context": "BC-1",
+      "bounded_context_name": "conversation_management",
+      "component": "COMP-1",
+      "module_path": "src/conversation_management/infrastructure/repositories/sqlite_school_repository.py",
+      "technology": "sqlite3 (stdlib)",
+      "purpose": "Resolves the School associated with a user by joining Users and Schools. Provides the fundraising anchor seed for DecisionContext initialization.",
+      "db_tables": "Users (school_id) JOIN Schools (id, name, address)",
+      "responsibilities": [
+        "Look up user's school_id from Users table",
+        "Retrieve school record from Schools table",
+        "Map to School(school_id, name, address)"
+      ],
+      "dependencies": ["sqlite3 (stdlib)", "db_path: str config"],
+      "constructor_params": ["db_path: str"],
+      "methods": [
+        {
+          "signature": "find_by_user_id(user_id: str) -> Optional[School]",
+          "logic": "SELECT s.id, s.name, s.address FROM Schools s JOIN Users u ON u.school_id = s.id WHERE u.id = ?. Return School(school_id=str(row.id), name=row.name, address=row.address) or None."
+        }
+      ]
+    },
+
+    {
+      "id": "ADAPT-13",
+      "name": "SQLitePurchaseHistoryRepository",
+      "type": "sqlite_read_adapter",
+      "port": "IPurchaseHistoryRepository",
+      "repository_id": "REPO-5",
+      "bounded_context": "BC-1",
+      "bounded_context_name": "conversation_management",
+      "component": "COMP-1",
+      "module_path": "src/conversation_management/infrastructure/repositories/sqlite_purchase_history_repository.py",
+      "technology": "sqlite3 (stdlib)",
+      "purpose": "Reads purchase history for a user from carton_caps_data.sqlite. Returns raw dicts matching the Purchase_History schema. Used by StartSessionUseCase to forward purchase signals to DecisionContext pre-seeding.",
+      "db_table": "Purchase_History (id, user_id, product_id, quantity, purchased_at)",
+      "responsibilities": [
+        "Query Purchase_History joined with Products for enriched product names",
+        "Return list of raw dicts (not domain objects — port contract specifies list[dict])",
+        "Return empty list when no history exists"
+      ],
+      "dependencies": ["sqlite3 (stdlib)", "db_path: str config"],
+      "constructor_params": ["db_path: str"],
+      "methods": [
+        {
+          "signature": "find_by_user_id(user_id: str) -> list[dict]",
+          "logic": "SELECT ph.id, ph.product_id, p.name as product_name, ph.quantity, ph.purchased_at FROM Purchase_History ph JOIN Products p ON p.id = ph.product_id WHERE ph.user_id = ?. Return as list of dicts."
+        }
+      ]
+    },
+
+    {
+      "id": "ADAPT-14",
+      "name": "InMemoryDecisionContextRepository",
+      "type": "in_memory_repository_adapter",
+      "port": "IDecisionContextRepository",
+      "repository_id": "REPO-6",
+      "bounded_context": "BC-2",
+      "bounded_context_name": "decision_intelligence",
+      "component": "COMP-2",
+      "module_path": "src/decision_intelligence/infrastructure/repositories/in_memory_decision_context_repository.py",
+      "technology": "Python dict (in-process)",
+      "purpose": "Persists DecisionContext aggregates in a dict keyed by session_id. Each session has exactly one context. Adequate for prototype use.",
+      "responsibilities": [
+        "Store DecisionContext by session_id",
+        "Retrieve DecisionContext by session_id"
+      ],
+      "dependencies": [],
+      "constructor_params": [],
+      "methods": [
+        {
+          "signature": "save(context: DecisionContext) -> None",
+          "logic": "self._contexts[context.session_id] = context"
+        },
+        {
+          "signature": "find_by_session_id(session_id: str) -> Optional[DecisionContext]",
+          "logic": "return self._contexts.get(session_id)"
+        }
+      ]
+    },
+
+    {
+      "id": "ADAPT-15",
+      "name": "SQLiteRAGMetricsLogger",
+      "type": "observability_adapter",
+      "port": "IRAGMetricsLogger",
+      "bounded_context": "BC-1",
+      "bounded_context_name": "conversation_management",
+      "component": "COMP-1",
+      "module_path": "src/conversation_management/infrastructure/observability/sqlite_rag_metrics_logger.py",
+      "technology": "sqlite3 (stdlib)",
+      "purpose": "Persists RAG evaluation metrics for every conversation turn to a dedicated rag_metrics.sqlite database. Provides operational observability over recall, precision, groundedness, and relevance scores — the core quality signals of the RAG pipeline.",
+      "db_path": "data/rag_metrics.sqlite",
+      "db_schema": {
+        "table": "rag_metrics",
+        "columns": [
+          "id INTEGER PRIMARY KEY AUTOINCREMENT",
+          "session_id TEXT NOT NULL",
+          "turn_number INTEGER NOT NULL",
+          "intent TEXT NOT NULL",
+          "context_state TEXT NOT NULL",
+          "context_recall_score REAL NOT NULL",
+          "context_precision_score REAL NOT NULL",
+          "groundedness_score REAL NOT NULL",
+          "relevance_score REAL NOT NULL",
+          "is_fallback INTEGER NOT NULL",
+          "clarification_needed INTEGER NOT NULL",
+          "evidence_chunk_count INTEGER NOT NULL",
+          "timestamp TEXT NOT NULL"
+        ]
+      },
+      "responsibilities": [
+        "Create the rag_metrics table if it does not exist (auto-migration on first run)",
+        "Insert one row per ProcessTurnUseCase execution",
+        "Never raise exceptions silently — log write failures to stderr without interrupting the turn"
+      ],
+      "dependencies": ["sqlite3 (stdlib)", "db_path: str config"],
+      "constructor_params": ["db_path: str"],
+      "methods": [
+        {
+          "signature": "log_turn_metrics(metrics: TurnMetricsDTO) -> None",
+          "logic": "INSERT into rag_metrics with all fields from TurnMetricsDTO. Commit immediately. Catch and print any sqlite3.Error to stderr."
+        }
+      ],
+      "observability_value": "Enables the following queries out of the box: (1) average recall/precision per session, (2) fallback rate over time, (3) turns where groundedness < 0.8 (quality failures), (4) sessions with high clarification_needed rate (context gap pattern), (5) intent distribution across all turns."
+    }
+
+  ],
+
+  "folder_structure": {
+    "note": "Infrastructure adapters live in an infrastructure/ subfolder inside each bounded context, following the layered architecture. The ingestion pipeline gets a Qdrant writer replacing ChromaDB.",
+    "BC-1": {
+      "root": "src/conversation_management/infrastructure/",
+      "sub_folders": {
+        "llm/": [
+          "openai_intent_classifier.py     — ADAPT-2",
+          "openai_response_generator.py    — ADAPT-3",
+          "openai_response_evaluator.py    — ADAPT-4"
+        ],
+        "repositories/": [
+          "in_memory_conversation_session_repository.py  — ADAPT-9",
+          "in_memory_conversation_history_repository.py  — ADAPT-10 (legacy / alternate)",
+          "sqlite_conversation_history_repository.py      — ADAPT-16",
+          "sqlite_user_repository.py                     — ADAPT-11",
+          "sqlite_school_repository.py                   — ADAPT-12",
+          "sqlite_purchase_history_repository.py         — ADAPT-13"
+        ],
+        "observability/": [
+          "sqlite_rag_metrics_logger.py   — ADAPT-15",
+          "logging_event_publisher.py     — ADAPT-17 (shell layer, see shell/composition/)"
+        ]
+      },
+      "new_application_port": "src/conversation_management/application/ports/i_rag_metrics_logger.py",
+      "new_event_publisher_port": "src/conversation_management/application/ports/i_event_publisher.py — BC-1 IEventPublisher"
+    },
+    "BC-2": {
+      "root": "src/decision_intelligence/infrastructure/",
+      "sub_folders": {
+        "llm/": [
+          "openai_signal_extractor.py    — ADAPT-5",
+          "openai_evidence_evaluator.py  — ADAPT-6"
+        ],
+        "repositories/": [
+          "in_memory_decision_context_repository.py  — ADAPT-14"
+        ]
+      },
+      "new_event_publisher_port": "src/decision_intelligence/application/ports/i_event_publisher.py — BC-2 IEventPublisher"
+    },
+    "shell": {
+      "root": "src/shell/composition/",
+      "files": [
+        "logging_event_publisher.py  — ADAPT-17 (satisfies both BC-1 and BC-2 IEventPublisher ports)"
+      ]
+    },
+    "BC-3": {
+      "root": "src/knowledge_retrieval/infrastructure/",
+      "sub_folders": {
+        "repositories/": [
+          "qdrant_product_repository.py        — ADAPT-7",
+          "qdrant_referral_rule_repository.py  — ADAPT-8"
+        ]
+      }
+    },
+    "ingestion": {
+      "root": "src/ingestion/infrastructure/vector_store/",
+      "files": [
+        "qdrant_writer.py    — ADAPT-1 (new, replaces chroma_writer.py)"
+      ]
+    }
+  },
+
+  "port_to_adapter_mapping": [
+    { "port": "IVectorStoreWriter",                "adapter": "QdrantVectorStoreWriter",                        "id": "ADAPT-1" },
+    { "port": "IIntentClassifier",                 "adapter": "OpenAIIntentClassifier",                         "id": "ADAPT-2" },
+    { "port": "IResponseGenerator",                "adapter": "OpenAIResponseGenerator",                        "id": "ADAPT-3" },
+    { "port": "IResponseEvaluator",                "adapter": "OpenAIResponseEvaluator",                        "id": "ADAPT-4" },
+    { "port": "ISignalExtractor",                  "adapter": "OpenAISignalExtractor",                          "id": "ADAPT-5" },
+    { "port": "IEvidenceEvaluator",                "adapter": "OpenAIEvidenceEvaluator",                        "id": "ADAPT-6" },
+    { "port": "IProductRepository",                "adapter": "QdrantProductRepository",                        "id": "ADAPT-7" },
+    { "port": "IReferralRuleRepository",           "adapter": "QdrantReferralRuleRepository",                   "id": "ADAPT-8" },
+    { "port": "IConversationSessionRepository",    "adapter": "InMemoryConversationSessionRepository",          "id": "ADAPT-9" },
+    { "port": "IConversationHistoryRepository",    "adapter": "SQLiteConversationHistoryRepository",            "id": "ADAPT-16" },
+    { "port": "IUserRepository",                   "adapter": "SQLiteUserRepository",                           "id": "ADAPT-11" },
+    { "port": "ISchoolRepository",                 "adapter": "SQLiteSchoolRepository",                         "id": "ADAPT-12" },
+    { "port": "IPurchaseHistoryRepository",        "adapter": "SQLitePurchaseHistoryRepository",                "id": "ADAPT-13" },
+    { "port": "IDecisionContextRepository",        "adapter": "InMemoryDecisionContextRepository",              "id": "ADAPT-14" },
+    { "port": "IRAGMetricsLogger",                 "adapter": "SQLiteRAGMetricsLogger",                         "id": "ADAPT-15" },
+    { "port": "IEventPublisher (BC-1 + BC-2)",     "adapter": "LoggingEventPublisher",                          "id": "ADAPT-17" }
+  ],
+
+  "adapters_already_complete": [
+    {
+      "name": "DecisionIntelligenceAdapter",
+      "location": "src/shell/composition/adapters/decision_intelligence_adapter.py",
+      "port": "IDecisionIntelligenceService",
+      "status": "Built in Phase 5 — no changes needed"
+    },
+    {
+      "name": "KnowledgeRetrievalAdapter",
+      "location": "src/shell/composition/adapters/knowledge_retrieval_adapter.py",
+      "port": "IKnowledgeRetrievalService",
+      "status": "Built in Phase 5 — no changes needed"
+    }
+  ],
+
+  "observability_summary": {
+    "approach": "Observability is split into two synchronous sinks. RAG metrics are captured at the ProcessTurnUseCase boundary — after TurnGraph completes and before the response is returned to the API — through IRAGMetricsLogger. Domain events are captured at use-case boundaries through LoggingEventPublisher and written to a dedicated log file.",
+    "what_is_logged": [
+      "context_recall_score — Did the vector search find relevant evidence? (BC-2, IEvidenceEvaluator)",
+      "context_precision_score — Were the retrieved chunks tightly relevant? (BC-2, IEvidenceEvaluator)",
+      "groundedness_score — Are response claims traceable to evidence? (BC-1, IResponseEvaluator)",
+      "relevance_score — Does the response answer the user's question? (BC-1, IResponseEvaluator)",
+      "is_fallback — Did the quality gate fail and trigger a fallback?",
+      "clarification_needed — Did BC-2 detect context gaps requiring clarification?",
+      "intent — What was the classified user intent?",
+      "context_state — What was the DecisionContext state at retrieval time?"
+    ],
+    "domain_events_logged": [
+      "SessionStarted — emitted at complete_initialization(), logged via LoggingEventPublisher in StartSessionUseCase",
+      "TurnProcessed  — emitted at complete_turn(), logged via LoggingEventPublisher in ProcessTurnUseCase",
+      "SessionClosed  — emitted at close(), logged via LoggingEventPublisher in CloseSessionUseCase",
+      "ContextUpdated — emitted at add_signal(), logged via LoggingEventPublisher in ProcessTurnIntelligenceUseCase",
+      "GapDetected    — emitted at record_gap_evaluation(), logged via LoggingEventPublisher in ProcessTurnIntelligenceUseCase",
+      "ContextReady   — emitted at mark_ready(), logged via LoggingEventPublisher in ProcessTurnIntelligenceUseCase"
+    ],
+    "domain_event_log_location": "Default: data/domain_events.log (override with DOMAIN_EVENT_LOG_PATH)",
+    "domain_event_log_format": "%(asctime)s %(levelname)s %(name)s [DomainEvent] <EventType> <field>=<value> ...",
+    "query_examples": [
+      "SELECT session_id, AVG(context_recall_score), AVG(groundedness_score) FROM rag_metrics GROUP BY session_id",
+      "SELECT * FROM rag_metrics WHERE groundedness_score < 0.8 ORDER BY timestamp DESC",
+      "SELECT intent, COUNT(*), AVG(relevance_score) FROM rag_metrics GROUP BY intent",
+      "SELECT COUNT(*) * 1.0 / (SELECT COUNT(*) FROM rag_metrics) as fallback_rate FROM rag_metrics WHERE is_fallback = 1"
+    ],
+    "tooling": "Any SQLite viewer (DB Browser for SQLite, DBeaver, or sqlite3 CLI) can query rag_metrics.sqlite directly. No additional tooling required."
+  }
+}

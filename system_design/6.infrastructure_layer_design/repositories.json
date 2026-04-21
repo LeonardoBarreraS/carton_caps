@@ -1,0 +1,646 @@
+{
+  "system": "Carton Caps Conversational Assistant",
+  "version": "1.0",
+  "phase": "6 — Infrastructure Layer Design",
+  "task": "Repository Generator",
+  "derived_from": [
+    "use_cases.json",
+    "context_coordination.json",
+    "workflow_orchestration.json",
+    "adapters.json",
+    "domain_model.json",
+    "layered_architecture.json"
+  ],
+
+  "design_principles": [
+    "Repository interfaces are defined in the domain layer — they are part of the domain model, not application services",
+    "Repository implementations are infrastructure adapters — they translate between domain objects and storage technology",
+    "No domain logic or invariant enforcement lives in repository implementations",
+    "Repository consumers depend only on the interface — never the implementation",
+    "Each aggregate has exactly one repository interface; implementations may vary by storage backend",
+    "Read-only repositories (User, School, PurchaseHistory) reflect pre-existing fixture data — this system never writes to those tables",
+    "Search repositories (Product, ReferralRule) expose only semantic search — never mutation — matching the read-only nature of the vector store at runtime",
+    "In-memory implementations are used for all session-scoped aggregates in the prototype — they are architecturally correct, not a shortcut",
+    "SQLiteConversationHistoryRepository is the primary implementation for ConversationHistory — it provides durable conversation persistence. InMemoryConversationHistoryRepository is retained as a development/test variant",
+    "Persistence mapping is the sole responsibility of the repository implementation — the domain entity is never aware of how it is stored"
+  ],
+
+  "repositories": [
+
+    {
+      "id": "REPO-1",
+      "name": "ConversationSessionRepository",
+      "category": "aggregate_repository",
+      "aggregate": "ConversationSession",
+      "aggregate_role": "aggregate root of BC-1 — full session lifecycle, state machine",
+      "bounded_context": "BC-1",
+      "bounded_context_name": "conversation_management",
+
+      "interface": {
+        "name": "IConversationSessionRepository",
+        "layer": "domain",
+        "module_path": "src/conversation_management/domain/ports/i_conversation_session_repository.py",
+        "methods": [
+          {
+            "signature": "save(session: ConversationSession) -> None",
+            "purpose": "Persist or update the ConversationSession aggregate after state transitions (begin_initialization, complete_initialization, receive_message, complete_turn, close)."
+          },
+          {
+            "signature": "find_by_id(session_id: str) -> Optional[ConversationSession]",
+            "purpose": "Load a session by its unique session_id. Returns None if not found. Used by ProcessTurnUseCase and CloseSessionUseCase."
+          },
+          {
+            "signature": "find_active_by_user_id(user_id: str) -> Optional[ConversationSession]",
+            "purpose": "Return the active or idle session for a user, or None. Used by StartSessionUseCase to enforce INV-CS-7 (one session per user)."
+          }
+        ]
+      },
+
+      "implementations": [
+        {
+          "name": "InMemoryConversationSessionRepository",
+          "adapter_id": "ADAPT-9",
+          "module_path": "src/conversation_management/infrastructure/repositories/in_memory_conversation_session_repository.py",
+          "storage_technology": "Python dict (in-process)",
+          "constructor_params": ["none — self-initializing"],
+          "persistence_mapping": {
+            "storage": "dict[str, ConversationSession] keyed by session_id",
+            "domain_object": "ConversationSession stored by reference — no serialization needed",
+            "find_active_scan": "Linear scan over all dict values; filters on session.user_id == user_id AND session.status in {ACTIVE, IDLE}"
+          },
+          "scope": "process lifetime — session state is lost on restart",
+          "rationale": "Session state is per-turn scoped and does not require durability in the prototype. In-memory provides zero-latency access for the multi-turn pipeline."
+        }
+      ],
+
+      "use_cases_served": [
+        {
+          "use_case": "UC-1 StartSessionUseCase",
+          "operations": ["find_active_by_user_id (INV-CS-7 guard)", "save (after complete_initialization)"]
+        },
+        {
+          "use_case": "UC-2 ProcessTurnUseCase",
+          "operations": ["find_by_id (load session before TurnGraph)", "save (after session.complete_turn — post-graph action)"]
+        },
+        {
+          "use_case": "UC-3 CloseSessionUseCase",
+          "operations": ["find_by_id (load session)", "save (after session.close — terminal state)"]
+        }
+      ],
+
+      "invariants_supported": [
+        "INV-CS-7 — one active/idle session per user enforced via find_active_by_user_id scan",
+        "INV-CS-2 — only idle sessions can be closed (enforced by domain; repository persists the result)"
+      ],
+
+      "notes": "ConversationSession is the primary aggregate root of BC-1. Its lifecycle spans the entire conversation (created → initializing → idle ↔ active → closed). The in-memory implementation is correct for the prototype; a SQLite or Redis-backed implementation would be the natural upgrade path for production."
+    },
+
+    {
+      "id": "REPO-2",
+      "name": "ConversationHistoryRepository",
+      "category": "append_repository",
+      "aggregate": "ConversationHistory",
+      "aggregate_role": "entity — append-only conversation log; two entries per successful turn",
+      "bounded_context": "BC-1",
+      "bounded_context_name": "conversation_management",
+
+      "interface": {
+        "name": "IConversationHistoryRepository",
+        "layer": "domain",
+        "module_path": "src/conversation_management/domain/ports/i_conversation_history_repository.py",
+        "methods": [
+          {
+            "signature": "append(entry: ConversationHistory) -> None",
+            "purpose": "Append a single ConversationHistory entry (user message or assistant response) to the durable log. Called twice per turn by the persist_turn node: once for the user message, once for the assistant response."
+          },
+          {
+            "signature": "find_by_user_id(user_id: str) -> list[ConversationHistory]",
+            "purpose": "Return all ConversationHistory entries for a user ordered chronologically. Used by StartSessionUseCase to load prior conversation context and by ProcessTurnUseCase to detect the prior clarification question."
+          }
+        ]
+      },
+
+      "implementations": [
+        {
+          "name": "SQLiteConversationHistoryRepository",
+          "adapter_id": "ADAPT-16",
+          "module_path": "src/conversation_management/infrastructure/repositories/sqlite_conversation_history_repository.py",
+          "storage_technology": "SQLite — carton_caps_data.sqlite — Conversation_History table",
+          "status": "primary (default)",
+          "constructor_params": ["db_path: str — path to carton_caps_data.sqlite"],
+          "persistence_mapping": {
+            "table": "Conversation_History",
+            "schema_migration": "On __init__, ALTER TABLE adds history_id (TEXT) and session_id (TEXT) columns if not already present. Existing rows receive empty-string defaults — backward compatible with legacy data.",
+            "columns": {
+              "history_id": "ConversationHistory.history_id — uuid4 string; 'legacy-{id}' for pre-migration rows",
+              "user_id": "ConversationHistory.user_id — cast to int for DB write; str on read",
+              "session_id": "ConversationHistory.session_id — empty string for legacy rows",
+              "message": "ConversationHistory.message — plain text",
+              "sender": "ConversationHistory.sender.value — translated via _DB_SENDER_MAP before write: 'user'→'user', 'assistant'→'bot' (satisfies CHECK constraint sender IN ('user', 'bot'))",
+              "timestamp": "ConversationHistory.timestamp.isoformat() — ISO-8601 UTC string"
+            },
+            "read_mapping": {
+              "sender": "Decoded via _SENDER_MAP: 'user'→SenderType.USER, 'assistant'/'bot'→SenderType.ASSISTANT; defaults to USER for unknown values",
+              "timestamp": "datetime.fromisoformat() with UTC awareness; defaults to datetime.now(UTC) if parse fails",
+              "history_id": "Falls back to 'legacy-{row.id}' for rows created before schema migration"
+            }
+          },
+          "rationale": "Durable message persistence. Conversation history must survive session restarts and be queryable for context loading at session initialization."
+        },
+        {
+          "name": "InMemoryConversationHistoryRepository",
+          "adapter_id": "ADAPT-10",
+          "module_path": "src/conversation_management/infrastructure/repositories/in_memory_conversation_history_repository.py",
+          "storage_technology": "Python defaultdict(list) keyed by user_id (in-process)",
+          "status": "development/test variant",
+          "constructor_params": ["none — self-initializing"],
+          "persistence_mapping": {
+            "storage": "defaultdict(list[ConversationHistory]) keyed by user_id",
+            "domain_object": "ConversationHistory stored by reference — no serialization",
+            "ordering": "Insertion order (chronological) preserved by list"
+          },
+          "rationale": "Zero-setup alternative for unit testing and local development without a SQLite file. History is lost on restart — not for production use."
+        }
+      ],
+
+      "use_cases_served": [
+        {
+          "use_case": "UC-1 StartSessionUseCase",
+          "operations": ["find_by_user_id (load full conversation history for history injection into conversation_history: list[dict])"]
+        },
+        {
+          "use_case": "UC-2 ProcessTurnUseCase (via persist_turn node in TurnGraph)",
+          "operations": ["append (user message entry — sender=user)", "append (assistant response entry — sender=assistant)"]
+        }
+      ],
+
+      "invariants_supported": [
+        "INV-WF-1 — turn persisted to history on successful completion (append called from persist_turn node)"
+      ],
+
+      "notes": "Conversation history is append-only — there is no update or delete method. ConversationHistory.create() generates a uuid4 history_id per entry. Two entries are appended per successful turn. The full history is loaded in ProcessTurnUseCase via find_by_user_id() and mapped to conversation_history: list[dict] for injection into TurnGraph and all LLM calls (Proposal B — explicit history injection)."
+    },
+
+    {
+      "id": "REPO-3",
+      "name": "UserRepository",
+      "category": "read_only_repository",
+      "aggregate": "User",
+      "aggregate_role": "identity entity — carries user_id, school_id, and name; never mutated by this system",
+      "bounded_context": "BC-1",
+      "bounded_context_name": "conversation_management",
+
+      "interface": {
+        "name": "IUserRepository",
+        "layer": "domain",
+        "module_path": "src/conversation_management/domain/ports/i_user_repository.py",
+        "methods": [
+          {
+            "signature": "find_by_id(user_id: str) -> Optional[User]",
+            "purpose": "Load a User identity record by user_id. Returns None if not found. Called by StartSessionUseCase to validate user existence (INV-CS-6) and by ProcessTurnUseCase to load User.name for LLM personalization."
+          }
+        ]
+      },
+
+      "implementations": [
+        {
+          "name": "SQLiteUserRepository",
+          "adapter_id": "ADAPT-11",
+          "module_path": "src/conversation_management/infrastructure/repositories/sqlite_user_repository.py",
+          "storage_technology": "SQLite — carton_caps_data.sqlite — Users table (read-only)",
+          "constructor_params": ["db_path: str — path to carton_caps_data.sqlite"],
+          "persistence_mapping": {
+            "table": "Users",
+            "query": "SELECT id, school_id, name FROM Users WHERE id = ?",
+            "columns": {
+              "id": "User.user_id — int in DB; str in domain",
+              "school_id": "User.school_id — int in DB; str in domain",
+              "name": "User.name — str; used for LLM personalization in ProcessTurnUseCase"
+            },
+            "id_cast": "user_id string is cast to int for SQL query; returns None for non-numeric user_ids"
+          },
+          "write_operations": "none — this system never writes to Users"
+        }
+      ],
+
+      "use_cases_served": [
+        {
+          "use_case": "UC-1 StartSessionUseCase",
+          "operations": ["find_by_id (INV-CS-6 guard — raise NotFoundError if user does not exist)"]
+        },
+        {
+          "use_case": "UC-2 ProcessTurnUseCase",
+          "operations": ["find_by_id — load User.name for LLM personalization before TurnGraph invocation"]
+        }
+      ],
+
+      "invariants_supported": [
+        "INV-CS-6 — user must exist before a session can be created"
+      ],
+
+      "notes": "User carries user_id, school_id, and name. name is loaded from the Users.name column and injected into TurnGraphState as user_name. ProcessTurnUseCase uses it alongside school_name to personalize all user-facing LLM responses (generate, generate_clarification, generate_out_of_scope in OpenAIResponseGenerator)."
+    },
+
+    {
+      "id": "REPO-4",
+      "name": "SchoolRepository",
+      "category": "read_only_repository",
+      "aggregate": "School",
+      "aggregate_role": "fundraising anchor entity — provides school_id and name for DecisionContext seeding",
+      "bounded_context": "BC-1",
+      "bounded_context_name": "conversation_management",
+
+      "interface": {
+        "name": "ISchoolRepository",
+        "layer": "domain",
+        "module_path": "src/conversation_management/domain/ports/i_school_repository.py",
+        "methods": [
+          {
+            "signature": "find_by_user_id(user_id: str) -> Optional[School]",
+            "purpose": "Load the School associated with a user via their school_id foreign key. Returns None if not found. Called by StartSessionUseCase to provide the fundraising school anchor for DecisionContext seeding (INV-CS-3)."
+          }
+        ]
+      },
+
+      "implementations": [
+        {
+          "name": "SQLiteSchoolRepository",
+          "adapter_id": "ADAPT-12",
+          "module_path": "src/conversation_management/infrastructure/repositories/sqlite_school_repository.py",
+          "storage_technology": "SQLite — carton_caps_data.sqlite — Schools + Users JOIN (read-only)",
+          "constructor_params": ["db_path: str — path to carton_caps_data.sqlite"],
+          "persistence_mapping": {
+            "join": "SELECT s.id, s.name, s.address FROM Schools s JOIN Users u ON u.school_id = s.id WHERE u.id = ?",
+            "columns": {
+              "s.id": "School.school_id — int in DB; str in domain",
+              "s.name": "School.name",
+              "s.address": "School.address"
+            },
+            "id_cast": "user_id string is cast to int for SQL query"
+          },
+          "write_operations": "none — this system never writes to Schools"
+        }
+      ],
+
+      "use_cases_served": [
+        {
+          "use_case": "UC-1 StartSessionUseCase",
+          "operations": ["find_by_user_id (raise NotFoundError if school not found; school_name forwarded in PreSeedContextDTO to BC-2)"]
+        }
+      ],
+
+      "invariants_supported": [
+        "INV-CS-3 — school must be pre-seeded into DecisionContext before session becomes active",
+        "INV-DC-2 — DecisionContext created with school anchor, not blank"
+      ],
+
+      "notes": "School is the fundraising anchor of the entire session. Its school_id and name are forwarded to BC-2 via PreSeedContextDTO in StartSessionUseCase. The repository resolves school indirectly through the user's school_id foreign key — there is no direct school_id lookup from the application layer."
+    },
+
+    {
+      "id": "REPO-5",
+      "name": "PurchaseHistoryRepository",
+      "category": "read_only_repository",
+      "aggregate": "PurchaseHistory (raw dict records — intentionally no domain entity wrapper)",
+      "aggregate_role": "purchase signal source — provides pre-session purchase data as preference seeds for BC-2",
+      "bounded_context": "BC-1",
+      "bounded_context_name": "conversation_management",
+
+      "interface": {
+        "name": "IPurchaseHistoryRepository",
+        "layer": "domain",
+        "module_path": "src/conversation_management/domain/ports/i_purchase_history_repository.py",
+        "methods": [
+          {
+            "signature": "find_by_user_id(user_id: str) -> list[dict]",
+            "purpose": "Return all purchase history records for a user as raw dicts. Returns empty list gracefully when no records exist. Used by StartSessionUseCase to build the purchase_signals list for PreSeedContextDTO sent to BC-2."
+          }
+        ]
+      },
+
+      "implementations": [
+        {
+          "name": "SQLitePurchaseHistoryRepository",
+          "adapter_id": "ADAPT-13",
+          "module_path": "src/conversation_management/infrastructure/repositories/sqlite_purchase_history_repository.py",
+          "storage_technology": "SQLite — carton_caps_data.sqlite — Purchase_History + Products JOIN (read-only)",
+          "constructor_params": ["db_path: str — path to carton_caps_data.sqlite"],
+          "persistence_mapping": {
+            "join": "SELECT ph.id, ph.product_id, p.name AS product_name, ph.quantity, ph.purchased_at FROM Purchase_History ph JOIN Products p ON p.id = ph.product_id WHERE ph.user_id = ? ORDER BY ph.purchased_at DESC",
+            "return_type": "list[dict] — plain Python dicts",
+            "dict_keys": ["id", "product_id", "product_name", "quantity", "purchased_at"],
+            "domain_entity": "none — raw dict by design; purchase records are signal seeds for BC-2, not first-class domain entities in BC-1"
+          },
+          "write_operations": "none — this system never writes to Purchase_History"
+        }
+      ],
+
+      "use_cases_served": [
+        {
+          "use_case": "UC-1 StartSessionUseCase",
+          "operations": ["find_by_user_id (optional signal — empty list handled gracefully; dicts forwarded in PreSeedContextDTO.purchase_signals to BC-2 PreSeedContextUseCase)"]
+        }
+      ],
+
+      "invariants_supported": [],
+
+      "notes": "PurchaseHistory intentionally returns list[dict] rather than a domain entity. This is a deliberate design decision: purchase records are used only as preference signal seeds to bootstrap DecisionContext in BC-2. They cross the BC-1→BC-2 boundary as primitive data in PreSeedContextDTO. There is no purchase domain entity in BC-1 and adding one would create unnecessary coupling."
+    },
+
+    {
+      "id": "REPO-6",
+      "name": "DecisionContextRepository",
+      "category": "aggregate_repository",
+      "aggregate": "DecisionContext",
+      "aggregate_role": "aggregate root of BC-2 — stateful preference signal accumulator scoped to a session",
+      "bounded_context": "BC-2",
+      "bounded_context_name": "decision_intelligence",
+
+      "interface": {
+        "name": "IDecisionContextRepository",
+        "layer": "domain",
+        "module_path": "src/decision_intelligence/domain/ports/i_decision_context_repository.py",
+        "methods": [
+          {
+            "signature": "save(context: DecisionContext) -> None",
+            "purpose": "Persist or update the DecisionContext aggregate. Called by PreSeedContextUseCase at session initialization, and by ProcessTurnIntelligenceUseCase after each turn (post-graph action)."
+          },
+          {
+            "signature": "find_by_session_id(session_id: str) -> Optional[DecisionContext]",
+            "purpose": "Load the DecisionContext for the given session. Called at the start of each turn by ProcessTurnIntelligenceUseCase before invoking the DecisionIntelligenceSubgraph."
+          }
+        ]
+      },
+
+      "implementations": [
+        {
+          "name": "InMemoryDecisionContextRepository",
+          "adapter_id": "ADAPT-14",
+          "module_path": "src/decision_intelligence/infrastructure/repositories/in_memory_decision_context_repository.py",
+          "storage_technology": "Python dict (in-process)",
+          "constructor_params": ["none — self-initializing"],
+          "persistence_mapping": {
+            "storage": "dict[str, DecisionContext] keyed by session_id",
+            "domain_object": "DecisionContext stored by reference — no serialization needed",
+            "scope": "one entry per active session; entries are never explicitly deleted in the prototype"
+          },
+          "scope": "process lifetime — DecisionContext is lost on restart",
+          "rationale": "DecisionContext accumulates preference signals within a session. Session state is inherently transient in the prototype — cross-restart persistence is not required. In-memory ensures zero-latency access across all turns. The natural upgrade path for production is SQLite serialization or Redis."
+        }
+      ],
+
+      "use_cases_served": [
+        {
+          "use_case": "UC-4 PreSeedContextUseCase",
+          "operations": ["save (create and persist initial DecisionContext with school anchor and purchase signals)"]
+        },
+        {
+          "use_case": "UC-5 ProcessTurnIntelligenceUseCase",
+          "operations": ["find_by_session_id (load context before DecisionIntelligenceSubgraph invocation)", "save (persist updated context after graph returns — post-graph action)"]
+        }
+      ],
+
+      "invariants_supported": [
+        "INV-DC-2 — DecisionContext created with school anchor (enforced by domain; repository persists the result)",
+        "INV-DC-5 — signals accumulate monotonically (enforced by context.add_signal(); repository persists accumulated state)",
+        "INV-CS-5 — DecisionContext seeded at session initialization (save called by PreSeedContextUseCase)"
+      ],
+
+      "notes": "DecisionContext is the stateful core of BC-2. Its signal list grows monotonically across turns — the repository simply overwrites the previous snapshot on each save (last-write-wins for the session-scoped key). The context's status transitions (empty→partial→ready→enriched) are all derived from domain methods; the repository stores and returns the current state without interpreting it."
+    },
+
+    {
+      "id": "REPO-7",
+      "name": "ProductRepository",
+      "category": "search_repository",
+      "aggregate": "Product",
+      "aggregate_role": "read-only domain entity — carries product facts retrieved from vector store",
+      "bounded_context": "BC-3",
+      "bounded_context_name": "knowledge_retrieval",
+
+      "interface": {
+        "name": "IProductRepository",
+        "layer": "domain",
+        "module_path": "src/knowledge_retrieval/domain/ports/i_product_repository.py",
+        "methods": [
+          {
+            "signature": "search(query_text: str, top_k: int) -> list[Product]",
+            "purpose": "Execute a semantic similarity search over the product_catalog Qdrant collection. Returns the top_k most relevant Product entities ranked by cosine similarity to the query embedding. Called by ExecuteRetrievalUseCase when source_target == 'product_catalog'."
+          }
+        ]
+      },
+
+      "implementations": [
+        {
+          "name": "QdrantProductRepository",
+          "adapter_id": "ADAPT-7",
+          "module_path": "src/knowledge_retrieval/infrastructure/repositories/qdrant_product_repository.py",
+          "storage_technology": "Qdrant vector store — product_catalog collection",
+          "constructor_params": [
+            "qdrant_url: str — Qdrant server URL (e.g. http://localhost:6333 or Qdrant Cloud URL)",
+            "openai_client: OpenAI — shared OpenAI client for embedding generation",
+            "collection_name: str = 'product_catalog'",
+            "qdrant_api_key: str | None = None — API key for Qdrant Cloud authentication; None for local instances"
+          ],
+          "persistence_mapping": {
+            "collection": "product_catalog",
+            "embedding_model": "text-embedding-3-small — same model used during ingestion; guarantees query-document vector space alignment",
+            "vector_size": 1536,
+            "similarity": "cosine",
+            "payload_to_domain": {
+              "product_id": "payload.product_id OR payload.doc_id OR str(point.id) — fallback chain",
+              "name": "payload.name",
+              "category": "payload.category",
+              "brand": "payload.brand",
+              "description": "payload.text — raw document text chunk",
+              "attributes": "{} — empty dict; not stored in current ingestion schema"
+            }
+          },
+          "write_operations": "none — runtime read-only. Write side: QdrantVectorStoreWriter (ADAPT-1) — offline ingestion pipeline."
+        }
+      ],
+
+      "use_cases_served": [
+        {
+          "use_case": "UC-6 ExecuteRetrievalUseCase",
+          "operations": ["search(query_text, top_k) when source_target == 'product_catalog'"]
+        }
+      ],
+
+      "invariants_supported": [
+        "INV-AR-2 — only retrieved products reach the response generator; no hallucination path",
+        "INV-WF-3 — retrieval completes before evidence is passed upstream to BC-1 for generation"
+      ],
+
+      "notes": "Product retrieval is purely semantic — no filtering by price, category, band, or stock is implemented at this scope. The same OpenAI embedding model used during ingestion (text-embedding-3-small) is used at query time to guarantee correct cosine distance comparisons. Embedding is generated inside the repository on every search call."
+    },
+
+    {
+      "id": "REPO-8",
+      "name": "ReferralRuleRepository",
+      "category": "search_repository",
+      "aggregate": "ReferralRule",
+      "aggregate_role": "read-only domain entity — carries referral program rule facts retrieved from vector store",
+      "bounded_context": "BC-3",
+      "bounded_context_name": "knowledge_retrieval",
+
+      "interface": {
+        "name": "IReferralRuleRepository",
+        "layer": "domain",
+        "module_path": "src/knowledge_retrieval/domain/ports/i_referral_rule_repository.py",
+        "methods": [
+          {
+            "signature": "search(query_text: str, top_k: int) -> list[ReferralRule]",
+            "purpose": "Execute a semantic similarity search over the referral_program_rules Qdrant collection. Returns the top_k most relevant ReferralRule entities ranked by cosine similarity. Called by ExecuteRetrievalUseCase when source_target == 'referral_program_rules'."
+          }
+        ]
+      },
+
+      "implementations": [
+        {
+          "name": "QdrantReferralRuleRepository",
+          "adapter_id": "ADAPT-8",
+          "module_path": "src/knowledge_retrieval/infrastructure/repositories/qdrant_referral_rule_repository.py",
+          "storage_technology": "Qdrant vector store — referral_program_rules collection",
+          "constructor_params": [
+            "qdrant_url: str — Qdrant server URL (e.g. http://localhost:6333 or Qdrant Cloud URL)",
+            "openai_client: OpenAI — shared OpenAI client for embedding generation",
+            "collection_name: str = 'referral_program_rules'",
+            "qdrant_api_key: str | None = None — API key for Qdrant Cloud authentication; None for local instances"
+          ],
+          "persistence_mapping": {
+            "collection": "referral_program_rules",
+            "embedding_model": "text-embedding-3-small — same model used during ingestion",
+            "vector_size": 1536,
+            "similarity": "cosine",
+            "payload_to_domain": {
+              "rule_id": "payload.doc_id OR str(point.id)",
+              "title": "payload.label",
+              "description": "payload.text — raw document text chunk",
+              "rule_type": "Mapped from payload.label via _LABEL_TO_RULE_TYPE: 'eligibility'→ELIGIBILITY, 'bonus'→BONUS, 'invitation'→INVITATION, 'requirement'→REQUIREMENT; defaults to ELIGIBILITY for unknown labels"
+            }
+          },
+          "write_operations": "none — runtime read-only. Write side: QdrantVectorStoreWriter (ADAPT-1) — offline ingestion pipeline."
+        }
+      ],
+
+      "use_cases_served": [
+        {
+          "use_case": "UC-6 ExecuteRetrievalUseCase",
+          "operations": ["search(query_text, top_k) when source_target == 'referral_program_rules'"]
+        }
+      ],
+
+      "invariants_supported": [
+        "INV-AR-3 — only retrieved referral rules reach the response generator; no hallucination path",
+        "INV-WF-3 — retrieval completes before evidence is passed upstream to BC-1 for generation"
+      ],
+
+      "notes": "The label→RuleType mapping (_LABEL_TO_RULE_TYPE) is the only domain-level translation beyond field assignment. Defaults to ELIGIBILITY for unrecognized labels — ensures the entity is always valid even if the Qdrant payload carries an unexpected label value from the ingestion pipeline."
+    }
+
+  ],
+
+  "repository_categories": {
+    "aggregate_repository": {
+      "description": "Full read/write lifecycle for a mutable aggregate root. Methods: save (create or update) + find_by_id / find_by_session_id.",
+      "repositories": ["REPO-1 ConversationSession (BC-1)", "REPO-6 DecisionContext (BC-2)"]
+    },
+    "append_repository": {
+      "description": "Append-only write + chronological query read. The entity log grows over time; individual entries are never updated or deleted.",
+      "repositories": ["REPO-2 ConversationHistory (BC-1)"]
+    },
+    "read_only_repository": {
+      "description": "Query only — this system never writes to these tables. Reflects pre-existing fixture data managed externally.",
+      "repositories": ["REPO-3 User (BC-1)", "REPO-4 School (BC-1)", "REPO-5 PurchaseHistory (BC-1)"]
+    },
+    "search_repository": {
+      "description": "Semantic similarity search only. No CRUD. Qdrant collections populated by the offline ingestion pipeline, not by this system's runtime.",
+      "repositories": ["REPO-7 Product (BC-3)", "REPO-8 ReferralRule (BC-3)"]
+    }
+  },
+
+  "folder_structure": {
+    "BC-1": {
+      "interfaces": "src/conversation_management/domain/ports/",
+      "implementations": "src/conversation_management/infrastructure/repositories/",
+      "interface_files": [
+        "i_conversation_session_repository.py",
+        "i_conversation_history_repository.py",
+        "i_user_repository.py",
+        "i_school_repository.py",
+        "i_purchase_history_repository.py"
+      ],
+      "implementation_files": [
+        "in_memory_conversation_session_repository.py",
+        "sqlite_conversation_history_repository.py   ← primary",
+        "in_memory_conversation_history_repository.py ← dev/test variant",
+        "sqlite_user_repository.py",
+        "sqlite_school_repository.py",
+        "sqlite_purchase_history_repository.py"
+      ]
+    },
+    "BC-2": {
+      "interfaces": "src/decision_intelligence/domain/ports/",
+      "implementations": "src/decision_intelligence/infrastructure/repositories/",
+      "interface_files": [
+        "i_decision_context_repository.py"
+      ],
+      "implementation_files": [
+        "in_memory_decision_context_repository.py"
+      ]
+    },
+    "BC-3": {
+      "interfaces": "src/knowledge_retrieval/domain/ports/",
+      "implementations": "src/knowledge_retrieval/infrastructure/repositories/",
+      "interface_files": [
+        "i_product_repository.py",
+        "i_referral_rule_repository.py"
+      ],
+      "implementation_files": [
+        "qdrant_product_repository.py",
+        "qdrant_referral_rule_repository.py"
+      ]
+    }
+  },
+
+  "interface_to_implementation_mapping": [
+    { "id": "REPO-1", "interface": "IConversationSessionRepository",  "implementation": "InMemoryConversationSessionRepository",          "adapter_id": "ADAPT-9",  "storage": "Python dict",                             "bc": "BC-1" },
+    { "id": "REPO-2", "interface": "IConversationHistoryRepository",  "implementation": "SQLiteConversationHistoryRepository (primary)", "adapter_id": "ADAPT-16", "storage": "SQLite Conversation_History",              "bc": "BC-1" },
+    { "id": "REPO-2", "interface": "IConversationHistoryRepository",  "implementation": "InMemoryConversationHistoryRepository (dev)",   "adapter_id": "ADAPT-10", "storage": "Python defaultdict",                      "bc": "BC-1" },
+    { "id": "REPO-3", "interface": "IUserRepository",                 "implementation": "SQLiteUserRepository",                         "adapter_id": "ADAPT-11", "storage": "SQLite Users (read-only)",                 "bc": "BC-1" },
+    { "id": "REPO-4", "interface": "ISchoolRepository",               "implementation": "SQLiteSchoolRepository",                       "adapter_id": "ADAPT-12", "storage": "SQLite Schools+Users JOIN (read-only)",    "bc": "BC-1" },
+    { "id": "REPO-5", "interface": "IPurchaseHistoryRepository",      "implementation": "SQLitePurchaseHistoryRepository",              "adapter_id": "ADAPT-13", "storage": "SQLite Purchase_History+Products JOIN (read-only)", "bc": "BC-1" },
+    { "id": "REPO-6", "interface": "IDecisionContextRepository",      "implementation": "InMemoryDecisionContextRepository",            "adapter_id": "ADAPT-14", "storage": "Python dict",                             "bc": "BC-2" },
+    { "id": "REPO-7", "interface": "IProductRepository",              "implementation": "QdrantProductRepository",                      "adapter_id": "ADAPT-7",  "storage": "Qdrant product_catalog",                  "bc": "BC-3" },
+    { "id": "REPO-8", "interface": "IReferralRuleRepository",         "implementation": "QdrantReferralRuleRepository",                 "adapter_id": "ADAPT-8",  "storage": "Qdrant referral_program_rules",            "bc": "BC-3" }
+  ],
+
+  "storage_summary": {
+    "sqlite": {
+      "database": "carton_caps_data.sqlite",
+      "tables": {
+        "Conversation_History": { "repository": "REPO-2", "access": "read + write (append)", "migration": "history_id and session_id columns added on first use" },
+        "Users":                { "repository": "REPO-3", "access": "read-only" },
+        "Schools + Users JOIN": { "repository": "REPO-4", "access": "read-only" },
+        "Purchase_History + Products JOIN": { "repository": "REPO-5", "access": "read-only" }
+      }
+    },
+    "qdrant": {
+      "collections": {
+        "product_catalog":         { "repository": "REPO-7", "access": "read-only (runtime search)", "write_side": "QdrantVectorStoreWriter ADAPT-1 — offline ingestion" },
+        "referral_program_rules":  { "repository": "REPO-8", "access": "read-only (runtime search)", "write_side": "QdrantVectorStoreWriter ADAPT-1 — offline ingestion" }
+      },
+      "embedding_model": "text-embedding-3-small — shared between write (ingestion) and read (runtime) sides"
+    },
+    "in_memory": {
+      "note": "Python dicts for session-scoped aggregate state that is transient by design in the prototype",
+      "repositories": [
+        "REPO-1 dict[session_id, ConversationSession]",
+        "REPO-6 dict[session_id, DecisionContext]",
+        "REPO-2 defaultdict(list) keyed by user_id — dev/test variant only"
+      ]
+    }
+  }
+}

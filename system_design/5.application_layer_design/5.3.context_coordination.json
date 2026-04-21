@@ -1,0 +1,406 @@
+{
+  "system": "Carton Caps Conversational Assistant",
+  "version": "1.0",
+  "phase": "5 — Application Layer Design",
+  "task": "Context Coordination",
+  "derived_from": [
+    "bounded_contexts.json",
+    "context_communication.json",
+    "workflow_orchestration.json",
+    "use_cases.json",
+    "components.json",
+    "layered_architecture.json"
+  ],
+
+  "design_principles": [
+    "Contexts are autonomous — no BC domain layer imports from another BC's domain layer",
+    "Coordination flows through port interfaces defined in the calling context's application layer",
+    "Adapters in the shell are the physical cross-context bridges — the only code that imports across component boundaries",
+    "Every cross-context payload is a primitive DTO — no domain object crosses a boundary",
+    "Coordination logic is embedded in the workflow graphs (TurnGraph, DecisionIntelligenceSubgraph) — no additional coordinator class is needed for a synchronous monolith",
+    "The shell composition root is the physical coordination hub — it instantiates adapters and injects them into use cases",
+    "Sagas are not needed — all bounded contexts are co-located, calls are synchronous, no distributed transaction exists"
+  ],
+
+  "coordination_model": {
+    "type": "synchronous_port_based",
+    "pattern": "Sequential — each BC is called in order, blocking until the result is returned. BC-1 leads and owns the turn transaction. BC-2 is called through a port and leads its own sub-pipeline (including the BC-3 retrieval call). The TurnGraph (WF-GRAPH-1) is the de facto ConversationTurnCoordinator.",
+    "rationale": "The RAG pipeline is inherently synchronous: evidence must be retrieved and evaluated before a response can be generated. Async coordination would add complexity without benefit. All three BCs are co-located in the same process. The port/adapter pattern already enforces context autonomy — the shell wires the adapters, and each BC sees only its own port interface.",
+    "physical_hub": "src/shell/composition/"
+  },
+
+  "coordinators": [
+
+    {
+      "id": "COORD-1",
+      "name": "SessionInitializationCoordinator",
+      "type": "embedded",
+      "realization": "StartSessionUseCase (UC-1)",
+      "realization_location": "src/conversation_management/application/use_cases/start_session_use_case.py",
+      "contexts_coordinated": ["BC-1 — Conversation Management", "BC-2 — Decision Intelligence"],
+      "trigger": "StartSessionCommand received from API entry point",
+      "coordination_pattern": "sequential two-context — BC-1 leads, BC-2 follows",
+      "purpose": "Coordinates session creation in BC-1 with DecisionContext initialization in BC-2. BC-1 loads all identity and history data, creates the session, then synchronously seeds BC-2 with the school anchor before the session becomes idle. Session readiness is gated on successful seeding (INV-CS-3).",
+
+      "coordination_flow": [
+        {
+          "step": 1,
+          "context": "BC-1",
+          "actor": "StartSessionUseCase",
+          "action": "Load User, School, ConversationHistory, PurchaseHistory from repositories",
+          "why": "All session context must be available before Decision Intelligence can be seeded"
+        },
+        {
+          "step": 2,
+          "context": "BC-1",
+          "actor": "ConversationSession domain",
+          "action": "ConversationSession.create(user_id, school_id) + session.begin_initialization() — session enters initializing state",
+          "why": "Session identity must exist before it can be anchored in DecisionContext (session_id is the correlation key)"
+        },
+        {
+          "step": 3,
+          "context": "BC-1 → BC-2",
+          "actor": "StartSessionUseCase via IDecisionIntelligenceService",
+          "action": "Build PreSeedContextDTO and call IDecisionIntelligenceService.pre_seed_context(PreSeedContextDTO)",
+          "adapter": "DecisionIntelligenceAdapter (shell) → PreSeedContextUseCase (BC-2)",
+          "payload_crossing": {
+            "dto": "PreSeedContextDTO",
+            "fields": [
+              { "field": "session_id",       "type": "str" },
+              { "field": "school_id",        "type": "str" },
+              { "field": "school_name",      "type": "str" },
+              { "field": "purchase_signals", "type": "list[str]" }
+            ]
+          },
+          "why": "BC-2 must create the DecisionContext anchored to this school before the first turn"
+        },
+        {
+          "step": 4,
+          "context": "BC-2",
+          "actor": "PreSeedContextUseCase",
+          "action": "DecisionContext.create(session_id, school_id, school_name) — seeds school anchor + purchase signals as initial PreferenceSignals; IDecisionContextRepository.save(context)",
+          "why": "Persistent context is created once per session; all future turns accumulate signals into it"
+        },
+        {
+          "step": 5,
+          "context": "BC-1",
+          "actor": "ConversationSession domain",
+          "action": "session.complete_initialization() — session transitions initializing → idle; emits SessionStarted; IConversationSessionRepository.save(session); return StartSessionResponse",
+          "why": "Session becomes idle (ready for turns) only after DecisionContext is confirmed initialized (enforces INV-CS-3, INV-CS-5)"
+        }
+      ],
+
+      "cross_context_payloads": [
+        {
+          "dto": "PreSeedContextDTO",
+          "direction": "BC-1 → BC-2",
+          "defined_in": "src/conversation_management/application/ports/i_decision_intelligence_service.py",
+          "fields": ["session_id: str", "school_id: str", "school_name: str", "purchase_signals: list[str]"]
+        }
+      ],
+
+      "adapters_used": [
+        "DecisionIntelligenceAdapter — src/shell/composition/adapters/decision_intelligence_adapter.py"
+      ],
+
+      "invariants_upheld": [
+        "INV-CS-3 — school pre-seeded into DecisionContext before session becomes active",
+        "INV-CS-5 — DecisionContext seeded at session initialization",
+        "INV-DC-2 — DecisionContext created with school anchor, not blank"
+      ]
+    },
+
+    {
+      "id": "COORD-2",
+      "name": "ConversationTurnCoordinator",
+      "type": "embedded",
+      "realization": "TurnGraph (WF-GRAPH-1) inside ProcessTurnUseCase (UC-2)",
+      "realization_location": "src/conversation_management/application/workflows/turn_graph.py",
+      "contexts_coordinated": [
+        "BC-1 — Conversation Management",
+        "BC-2 — Decision Intelligence",
+        "BC-3 — Knowledge Retrieval"
+      ],
+      "trigger": "ProcessTurnCommand received from API entry point",
+      "coordination_pattern": "stateful multi-context pipeline — BC-1 classifies and orchestrates; BC-2 builds context and constructs retrieval query; BC-3 executes retrieval; BC-2 evaluates evidence; BC-1 generates, evaluates, and persists response",
+      "purpose": "Coordinates the full conversation turn workflow across all three bounded contexts. Each context performs its autonomous responsibility; the TurnGraph advances the pipeline using conditional edges driven by intent classification, context readiness, and response quality scores. This is the system's core cross-context execution engine.",
+
+      "coordination_flow": [
+        {
+          "step": 1,
+          "context": "BC-1",
+          "actor": "TurnGraph — classify_intent node",
+          "action": "IIntentClassifier.classify(message) → Intent",
+          "why": "Intent determines whether retrieval is needed and which knowledge source to target"
+        },
+        {
+          "step": 2,
+          "context": "BC-1 → BC-2",
+          "actor": "TurnGraph — process_decision_intelligence node via IDecisionIntelligenceService",
+          "action": "IDecisionIntelligenceService.process_turn(TurnInputDTO) — port call via DecisionIntelligenceAdapter → ProcessTurnIntelligenceUseCase (BC-2)",
+          "adapter": "DecisionIntelligenceAdapter (shell) → ProcessTurnIntelligenceUseCase (BC-2)",
+          "payload_crossing": {
+            "dto": "TurnInputDTO",
+            "fields": [
+              { "field": "session_id", "type": "str" },
+              { "field": "intent",     "type": "str", "note": "string representation of Intent value object — not the domain object" },
+              { "field": "message",    "type": "str" }
+            ]
+          },
+          "why": "BC-2 needs the classified intent and raw message to extract signals and build the retrieval query from accumulated context"
+        },
+        {
+          "step": 3,
+          "context": "BC-2",
+          "actor": "DecisionIntelligenceSubgraph — extract_signals node",
+          "action": "ISignalExtractor.extract(message, turn_number) → list[PreferenceSignal]",
+          "why": "LLM adapter extracts structured key-value preferences from free-text message"
+        },
+        {
+          "step": 4,
+          "context": "BC-2",
+          "actor": "DecisionIntelligenceSubgraph — update_decision_context node",
+          "action": "context.add_signal() for each extracted signal; context_snapshot updated",
+          "why": "Monotonic accumulation — signals are never removed, only added (INV-DC-5)"
+        },
+        {
+          "step": 5,
+          "context": "BC-2",
+          "actor": "DecisionIntelligenceSubgraph — evaluate_context_readiness node",
+          "action": "context.has_gap() + context.is_ready_for_retrieval() — routing decision",
+          "routing_outcomes": [
+            "intent in _INTENT_SUFFICIENT_RETRIEVAL (referral_question) → bypass context readiness gate; proceed directly to construct_retrieval_query (message is the query; no preference signals required)",
+            "context not ready + gap detected → clarification_needed=True; skip retrieval; return to BC-1",
+            "intent is general_question / clarification_response → skip retrieval; return to BC-1 with empty evidence",
+            "context ready + retrieval intent → proceed to construct_retrieval_query"
+          ],
+          "why": "For preference-driven intents (product_inquiry), retrieval only proceeds when context is rich enough to produce a relevant query (INV-DC-4). For intent-sufficient intents (referral_question), the question text itself is the retrieval signal — context richness is not a prerequisite and the readiness gate is bypassed to prevent silent retrieval failures on first-turn referral questions."
+        },
+        {
+          "step": 6,
+          "context": "BC-2",
+          "actor": "DecisionIntelligenceSubgraph — construct_retrieval_query node",
+          "action": "RetrievalQuery.from_context() — builds enriched query string from context snapshot (signals + school anchor + intent). Vague-message backstop: if assembled content word count < _MIN_QUERY_CONTENT_WORDS (4), injects the most recent substantive prior user message from conversation_history (windowed, reversed scan) to resolve anaphorical references deterministically.",
+          "why": "Query is grounded in accumulated preference context, not the raw message (INV-RQ-1). History backstop prevents thin queries from anaphorical turns ('ok', 'tell me more') from producing poor recalls without requiring an extra LLM call."
+        },
+        {
+          "step": 7,
+          "context": "BC-2 → BC-3",
+          "actor": "DecisionIntelligenceSubgraph — execute_retrieval node via IKnowledgeRetrievalService",
+          "action": "IKnowledgeRetrievalService.retrieve(RetrievalQueryDTO) — port call via KnowledgeRetrievalAdapter → ExecuteRetrievalUseCase (BC-3)",
+          "adapter": "KnowledgeRetrievalAdapter (shell) → ExecuteRetrievalUseCase (BC-3)",
+          "payload_crossing": {
+            "dto": "RetrievalQueryDTO",
+            "fields": [
+              { "field": "query_text",    "type": "str" },
+              { "field": "source_target", "type": "str", "values": ["product_catalog", "referral_program_rules"] }
+            ]
+          },
+          "why": "BC-3 is the sole owner of all knowledge sources; only it may execute vector store retrieval"
+        },
+        {
+          "step": 8,
+          "context": "BC-3",
+          "actor": "ExecuteRetrievalUseCase",
+          "action": "Routes on source_target to IProductRepository or IReferralRuleRepository; executes semantic search; returns top-matching chunks",
+          "payload_crossing": {
+            "dto": "RetrievedEvidenceDTO",
+            "direction": "BC-3 → BC-2",
+            "fields": [
+              { "field": "chunks",        "type": "list[str]" },
+              { "field": "evidence_type", "type": "str", "values": ["product_evidence", "referral_rule_evidence"] }
+            ]
+          }
+        },
+        {
+          "step": 9,
+          "context": "BC-2",
+          "actor": "DecisionIntelligenceSubgraph — evaluate_evidence_quality node",
+          "action": "IEvidenceEvaluator.evaluate(query, evidence) → recall + precision scores",
+          "routing_outcomes": [
+            "recall >= MIN_RECALL_THRESHOLD → exit subgraph, return evidence to BC-1",
+            "recall < threshold AND attempts < MAX_RETRIES → retry: back-edge to construct_retrieval_query",
+            "recall < threshold AND attempts >= MAX_RETRIES → exit with degraded evidence flagged"
+          ],
+          "why": "Evidence quality must be evaluated before it can influence a response (INV-RE-1, INV-RE-2)"
+        },
+        {
+          "step": 10,
+          "context": "BC-2 → BC-1",
+          "actor": "ProcessTurnIntelligenceUseCase → DecisionIntelligenceAdapter → TurnGraph state",
+          "action": "BC-2 subgraph completes; use case saves DecisionContext; drains intra-component events (ContextUpdated, GapDetected, ContextReady); returns TurnIntelligenceResultDTO",
+          "payload_crossing": {
+            "dto": "TurnIntelligenceResultDTO",
+            "fields": [
+              { "field": "evidence_chunks",         "type": "list[str]" },
+              { "field": "evidence_type",           "type": "str" },
+              { "field": "context_recall_score",    "type": "float" },
+              { "field": "context_precision_score", "type": "float" },
+              { "field": "context_state",           "type": "str", "values": ["empty", "partial", "ready", "enriched"] },
+              { "field": "clarification_needed",    "type": "bool" },
+              { "field": "clarification_question",  "type": "str | null" }
+            ]
+          }
+        },
+        {
+          "step": 11,
+          "context": "BC-1",
+          "actor": "TurnGraph — generate_response or generate_clarification node",
+          "action": "IResponseGenerator.generate(message, evidence, context_snapshot) → AssistantResponse text",
+          "routing_outcomes": [
+            "clarification_needed=True → generate_clarification",
+            "intent=ambiguous → generate_clarification",
+            "all other intents → generate_response"
+          ],
+          "why": "Response is grounded in retrieved evidence from BC-3 (relayed through BC-2); LLM never invents product or referral facts"
+        },
+        {
+          "step": 12,
+          "context": "BC-1",
+          "actor": "TurnGraph — evaluate_response node → persist_turn or return_fallback node",
+          "action": "IResponseEvaluator.evaluate(response, intent, evidence) → groundedness + relevance scores",
+          "routing_outcomes": [
+            "scores pass thresholds → persist_turn (history saved, turn completed)",
+            "scores fail thresholds → return_fallback (safe response, is_fallback=True)"
+          ],
+          "why": "Quality gate before turn is committed (INV-AR-1, INV-AR-5, INV-AR-6)"
+        }
+      ],
+
+      "cross_context_payloads": [
+        {
+          "dto": "TurnInputDTO",
+          "direction": "BC-1 → BC-2",
+          "defined_in": "src/conversation_management/application/ports/i_decision_intelligence_service.py",
+          "fields": ["session_id: str", "intent: str", "message: str"]
+        },
+        {
+          "dto": "RetrievalQueryDTO",
+          "direction": "BC-2 → BC-3",
+          "defined_in": "src/decision_intelligence/application/ports/",
+          "fields": ["query_text: str", "source_target: str"]
+        },
+        {
+          "dto": "RetrievedEvidenceDTO",
+          "direction": "BC-3 → BC-2",
+          "defined_in": "src/decision_intelligence/application/ports/",
+          "fields": ["chunks: list[str]", "evidence_type: str"]
+        },
+        {
+          "dto": "TurnIntelligenceResultDTO",
+          "direction": "BC-2 → BC-1",
+          "defined_in": "src/conversation_management/application/ports/i_decision_intelligence_service.py",
+          "fields": [
+            "evidence_chunks: list[str]",
+            "evidence_type: str",
+            "context_recall_score: float",
+            "context_precision_score: float",
+            "context_state: str",
+            "clarification_needed: bool",
+            "clarification_question: str | null"
+          ]
+        }
+      ],
+
+      "coordination_state": {
+        "per_turn_state": "TurnGraphState (16 primitive fields) — lives in WF-GRAPH-1; is the turn-scoped coordination state for BC-1's orchestration",
+        "per_subgraph_state": "DecisionGraphState (18 primitive fields) — lives in WF-GRAPH-2; is the turn-scoped coordination state for BC-2's sub-pipeline",
+        "cross_context_state_note": "No domain object is shared across contexts. Context identity is correlated by session_id (a primitive string) present in all DTOs."
+      },
+
+      "adapters_used": [
+        "DecisionIntelligenceAdapter — src/shell/composition/adapters/decision_intelligence_adapter.py",
+        "KnowledgeRetrievalAdapter  — src/shell/composition/adapters/knowledge_retrieval_adapter.py"
+      ],
+
+      "invariants_upheld": [
+        "INV-WF-1 — intent classified before context update and retrieval",
+        "INV-WF-2 — context updated before query construction",
+        "INV-WF-3 — retrieval complete before response generation",
+        "INV-WF-4 — Decision Intelligence runs on every turn regardless of intent",
+        "INV-DC-4 — retrieval only triggered when context is partial/ready/enriched",
+        "INV-DC-5 — signals accumulate monotonically; never removed",
+        "INV-RQ-1 — retrieval query always built from context snapshot, never raw message",
+        "INV-RE-1 — evidence quality evaluated before reaches generation",
+        "INV-RE-2 — evidence with low recall triggers retry cycle",
+        "INV-AR-1 — response not delivered without passing quality thresholds",
+        "INV-AR-5 — quality failure triggers safe fallback, not a raw low-quality response",
+        "INV-AR-6 — groundedness and relevance both evaluated before turn persisted"
+      ]
+    }
+
+  ],
+
+  "saga_assessment": {
+    "sagas_needed": false,
+    "rationale": "The system is a synchronous co-located monolith. All three bounded contexts run in the same process. There are no distributed transactions, no network hops between components, and no partial state that must be rolled back. The RAG pipeline is fully request-scoped: if any step fails, the exception propagates to the API layer and no cross-context state is partially committed. This is safe because: (a) BC-3 retrieval is read-only; (b) BC-2 DecisionContext is saved only after the subgraph completes (post-graph action in UC-5); (c) BC-1 ConversationSession is saved only after TurnGraph completes (post-graph action in UC-2). Each context's write is a single atomic operation at use case boundary. Introducing saga compensation would be over-engineering for this architecture."
+  },
+
+  "shell_composition_role": {
+    "location": "src/shell/composition/",
+    "role": "Physical coordination hub. The only module in the system permitted to import across component boundaries. Instantiates cross-context adapters and injects them into use cases at startup via the dependency injection container.",
+    "adapters": [
+      {
+        "name": "DecisionIntelligenceAdapter",
+        "location": "src/shell/composition/adapters/decision_intelligence_adapter.py",
+        "implements": "IDecisionIntelligenceService (defined in COMP-1 application ports)",
+        "delegates_to": ["PreSeedContextUseCase (BC-2)", "ProcessTurnIntelligenceUseCase (BC-2)"],
+        "translation_responsibility": "Maps PreSeedContextDTO → BC-2 use case inputs; maps TurnInputDTO → BC-2 use case inputs; maps BC-2 outputs → TurnIntelligenceResultDTO",
+        "injected_into": "StartSessionUseCase (for pre_seed_context); TurnGraph (for process_turn, via ProcessTurnUseCase constructor)"
+      },
+      {
+        "name": "KnowledgeRetrievalAdapter",
+        "location": "src/shell/composition/adapters/knowledge_retrieval_adapter.py",
+        "implements": "IKnowledgeRetrievalService (defined in COMP-2 application ports)",
+        "delegates_to": ["ExecuteRetrievalUseCase (BC-3)"],
+        "translation_responsibility": "Maps RetrievalQueryDTO → BC-3 use case input; maps BC-3 output → RetrievedEvidenceDTO",
+        "injected_into": "DecisionIntelligenceSubgraph (for retrieve, via ProcessTurnIntelligenceUseCase constructor)"
+      }
+    ],
+    "wiring": "Container instantiates both adapters and injects them via constructor injection into use cases at application startup. The three BCs never import each other — they only see their own port interfaces."
+  },
+
+  "folder_structure": {
+    "note": "Context coordination does not require a dedicated /coordination/ folder for this system. The coordination is fully materialized through the existing workflow graphs and shell adapters. No additional coordinator classes are needed.",
+    "coordination_artifacts": [
+      {
+        "artifact": "TurnGraph — COORD-2 realization (cross-context turn coordinator)",
+        "path": "src/conversation_management/application/workflows/turn_graph.py"
+      },
+      {
+        "artifact": "DecisionIntelligenceSubgraph — nested sub-coordinator for BC-2 + BC-3",
+        "path": "src/decision_intelligence/application/workflows/decision_intelligence_subgraph.py"
+      },
+      {
+        "artifact": "DecisionIntelligenceAdapter — BC-1 → BC-2 cross-context bridge",
+        "path": "src/shell/composition/adapters/decision_intelligence_adapter.py"
+      },
+      {
+        "artifact": "KnowledgeRetrievalAdapter — BC-2 → BC-3 cross-context bridge",
+        "path": "src/shell/composition/adapters/knowledge_retrieval_adapter.py"
+      }
+    ]
+  },
+
+  "coordination_summary": {
+    "cross_context_workflows_count": 2,
+    "coordinators": [
+      {
+        "id": "COORD-1",
+        "name": "SessionInitializationCoordinator",
+        "contexts_spanned": 2,
+        "realization": "Embedded in StartSessionUseCase (UC-1)",
+        "pattern": "Sequential two-context"
+      },
+      {
+        "id": "COORD-2",
+        "name": "ConversationTurnCoordinator",
+        "contexts_spanned": 3,
+        "realization": "Embedded in TurnGraph (WF-GRAPH-1) inside ProcessTurnUseCase (UC-2)",
+        "pattern": "Stateful multi-context pipeline with quality gates and retry cycle"
+      }
+    ],
+    "sagas": "None — synchronous co-located monolith, no rollback required",
+    "design_verdict": "Context coordination for this system is fully covered by the existing workflow orchestration (TurnGraph, DecisionIntelligenceSubgraph) combined with the shell adapters (DecisionIntelligenceAdapter, KnowledgeRetrievalAdapter). The TurnGraph IS the ConversationTurnCoordinator. No additional coordinator classes are needed. The application layer is architecturally complete."
+  }
+}

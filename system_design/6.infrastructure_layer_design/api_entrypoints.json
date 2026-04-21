@@ -1,0 +1,411 @@
+{
+  "system": "Carton Caps Conversational Assistant",
+  "version": "1.0",
+  "phase": "6 — Infrastructure Layer Design",
+  "task": "API Entry Point Generator",
+  "derived_from": [
+    "use_cases.json",
+    "domain_model.json",
+    "context_communication.json",
+    "adapters.json",
+    "event_bus.json",
+    "layered_architecture.json",
+    "phase_6_task_analysis.md"
+  ],
+
+  "design_principles": [
+    "Entry points are the external boundary — they translate HTTP requests into application commands and return HTTP responses",
+    "No domain logic, invariant enforcement, or workflow orchestration lives in route handlers",
+    "Route handlers call use cases exclusively — never repositories, domain objects, or infrastructure adapters directly",
+    "Request validation is structural only (Pydantic schema) — semantic validation belongs to the use cases and domain",
+    "Exception handlers are registered once at the app level — route handlers never catch use-case exceptions themselves",
+    "The container is built once at startup and injected into the router — stateless request handlers share the same wired use case instances",
+    "Pydantic schemas (request/response) are defined in the API layer and are independent of use-case command/response dataclasses",
+    "HTTP status codes reflect the semantic outcome — 201 for resource creation, 200 for idempotent state transitions, 4xx for client errors"
+  ],
+
+  "framework": {
+    "name": "FastAPI",
+    "rationale": "FastAPI is the standard Python framework for AI/ML APIs. It provides async support, automatic OpenAPI documentation, Pydantic-based request validation, and exception handler registration. Minimal boilerplate for three endpoints.",
+    "transport": "HTTP/REST",
+    "auto_docs": "OpenAPI schema served at /docs (Swagger UI) and /redoc",
+    "entry_point_type": "REST"
+  },
+
+  "module_structure": {
+    "root": "src/shell/api/",
+    "files": [
+      {
+        "file": "src/shell/api/__init__.py",
+        "purpose": "Package marker"
+      },
+      {
+        "file": "src/shell/api/app.py",
+        "purpose": "FastAPI application factory. Creates the FastAPI instance, registers exception handlers, builds the container, creates and includes the router. Exposes create_app() for import by the ASGI server entry point."
+      },
+      {
+        "file": "src/shell/api/router.py",
+        "purpose": "Defines all three route handlers. Receives the wired AppContainer, builds commands from request schemas, calls use cases, maps responses back to Pydantic schemas."
+      },
+      {
+        "file": "src/shell/api/schemas.py",
+        "purpose": "Pydantic models for all request bodies and response envelopes. Strictly API-layer models — no imports from domain or application layers."
+      },
+      {
+        "file": "main.py",
+        "purpose": "ASGI entry point at workspace root. Imports create_app() and exposes the `app` instance for uvicorn. Single line: app = create_app()."
+      }
+    ]
+  },
+
+  "endpoints": [
+
+    {
+      "id": "EP-1",
+      "name": "StartSession",
+      "use_case": "UC-1 — StartSessionUseCase",
+      "use_case_module": "src/conversation_management/application/use_cases/start_session_use_case.py",
+      "method": "POST",
+      "path": "/sessions",
+      "http_status_success": 201,
+      "summary": "Create and initialise a new conversation session for a user",
+      "description": "Creates a ConversationSession, loads user/school/history data, pre-seeds DecisionContext in BC-2, and returns a session_id the client must use for subsequent turn calls. Enforces one active/idle session per user.",
+
+      "request": {
+        "schema_name": "StartSessionRequest",
+        "content_type": "application/json",
+        "fields": [
+          {
+            "name": "user_id",
+            "type": "str",
+            "required": true,
+            "validation": "non-empty string",
+            "note": "Pre-resolved trusted user identity. Never authenticated at this boundary."
+          }
+        ],
+        "example": {
+          "user_id": "u-42"
+        }
+      },
+
+      "response": {
+        "schema_name": "StartSessionResponseSchema",
+        "content_type": "application/json",
+        "fields": [
+          { "name": "session_id", "type": "str" },
+          { "name": "status", "type": "str", "note": "Always 'idle' on success" }
+        ],
+        "example": {
+          "session_id": "sess-a1b2c3",
+          "status": "idle"
+        }
+      },
+
+      "command_mapping": {
+        "command_class": "StartSessionCommand",
+        "mapping": {
+          "user_id": "request.user_id"
+        }
+      },
+
+      "error_map": [
+        {
+          "exception": "SessionConflictError",
+          "module": "start_session_use_case",
+          "http_status": 409,
+          "error_code": "SESSION_CONFLICT",
+          "message": "User already has an active or idle session"
+        },
+        {
+          "exception": "UserNotFoundError",
+          "module": "start_session_use_case",
+          "http_status": 404,
+          "error_code": "USER_NOT_FOUND",
+          "message": "User not found"
+        },
+        {
+          "exception": "SchoolNotFoundError",
+          "module": "start_session_use_case",
+          "http_status": 404,
+          "error_code": "SCHOOL_NOT_FOUND",
+          "message": "School not found for user"
+        }
+      ]
+    },
+
+    {
+      "id": "EP-2",
+      "name": "ProcessTurn",
+      "use_case": "UC-2 — ProcessTurnUseCase",
+      "use_case_module": "src/conversation_management/application/use_cases/process_turn_use_case.py",
+      "method": "POST",
+      "path": "/sessions/{session_id}/turns",
+      "http_status_success": 200,
+      "summary": "Submit a user message and receive the assistant's response",
+      "description": "Submits a message to an active session. Runs the full turn pipeline: intent classification, decision intelligence delegation, knowledge retrieval, response generation, and response evaluation. Returns the grounded assistant response. The session must exist and be in idle state.",
+
+      "path_parameters": [
+        {
+          "name": "session_id",
+          "type": "str",
+          "note": "Session identifier returned by POST /sessions"
+        }
+      ],
+
+      "request": {
+        "schema_name": "ProcessTurnRequest",
+        "content_type": "application/json",
+        "fields": [
+          {
+            "name": "user_id",
+            "type": "str",
+            "required": true,
+            "validation": "non-empty string",
+            "note": "Must match the user_id that created the session"
+          },
+          {
+            "name": "message",
+            "type": "str",
+            "required": true,
+            "validation": "non-empty string",
+            "note": "Raw user message text"
+          }
+        ],
+        "example": {
+          "user_id": "u-42",
+          "message": "What products do you have for kids aged 5 to 8?"
+        }
+      },
+
+      "response": {
+        "schema_name": "ProcessTurnResponseSchema",
+        "content_type": "application/json",
+        "fields": [
+          { "name": "session_id", "type": "str" },
+          { "name": "response_text", "type": "str", "note": "The assistant's grounded response text, or fallback message" },
+          { "name": "intent", "type": "str", "note": "Classified intent: product_inquiry | referral_question | general_question | clarification_response | ambiguous | out_of_scope" },
+          { "name": "is_fallback", "type": "bool", "note": "True if quality scores failed and a safe fallback was returned" },
+          { "name": "groundedness_score", "type": "float", "note": "0.0 – 1.0; how well the response is anchored in retrieved evidence" },
+          { "name": "context_precision_score", "type": "float", "note": "0.0 – 1.0; fraction of retrieved chunks that are actually relevant" },
+          { "name": "context_recall_score", "type": "float", "note": "0.0 – 1.0; fraction of relevant information that was retrieved" },
+          { "name": "relevance_score", "type": "float", "note": "0.0 – 1.0; how directly the response addresses the user's question" }
+        ],
+        "example": {
+          "session_id": "sess-a1b2c3",
+          "response_text": "We have the Explorer Backpack and the Junior Art Set, both popular with kids in that age range at Lincoln Elementary.",
+          "intent": "product_inquiry",
+          "is_fallback": false,
+          "groundedness_score": 0.91,
+          "context_precision_score": 0.85,
+          "context_recall_score": 0.78,
+          "relevance_score": 0.88
+        }
+      },
+
+      "command_mapping": {
+        "command_class": "ProcessTurnCommand",
+        "mapping": {
+          "session_id": "path parameter session_id",
+          "user_id": "request.user_id",
+          "message": "request.message"
+        }
+      },
+
+      "error_map": [
+        {
+          "exception": "SessionNotFoundError",
+          "module": "process_turn_use_case",
+          "http_status": 404,
+          "error_code": "SESSION_NOT_FOUND",
+          "message": "Session not found"
+        },
+        {
+          "exception": "InvalidTurnStateError",
+          "module": "process_turn_use_case",
+          "http_status": 422,
+          "error_code": "INVALID_SESSION_STATE",
+          "message": "Session is not in a state that accepts turns"
+        },
+        {
+          "exception": "SessionOwnershipError",
+          "module": "process_turn_use_case",
+          "http_status": 403,
+          "error_code": "OWNERSHIP_MISMATCH",
+          "message": "User does not own this session"
+        }
+      ]
+    },
+
+    {
+      "id": "EP-3",
+      "name": "CloseSession",
+      "use_case": "UC-3 — CloseSessionUseCase",
+      "use_case_module": "src/conversation_management/application/use_cases/close_session_use_case.py",
+      "method": "DELETE",
+      "path": "/sessions/{session_id}",
+      "http_status_success": 200,
+      "summary": "Close a conversation session",
+      "description": "Transitions the session to the closed terminal state. Only idle sessions (not mid-turn) can be closed. The requesting user must own the session.",
+
+      "path_parameters": [
+        {
+          "name": "session_id",
+          "type": "str",
+          "note": "Session identifier returned by POST /sessions"
+        }
+      ],
+
+      "request": {
+        "schema_name": "CloseSessionRequest",
+        "content_type": "application/json",
+        "note": "DELETE body carries user_id for ownership verification. Alternatively can be passed as a query parameter — body is simpler for prototype.",
+        "fields": [
+          {
+            "name": "user_id",
+            "type": "str",
+            "required": true,
+            "note": "Must match the user_id that created the session"
+          }
+        ],
+        "example": {
+          "user_id": "u-42"
+        }
+      },
+
+      "response": {
+        "schema_name": "CloseSessionResponseSchema",
+        "content_type": "application/json",
+        "fields": [
+          { "name": "session_id", "type": "str" },
+          { "name": "status", "type": "str", "note": "Always 'closed' on success" }
+        ],
+        "example": {
+          "session_id": "sess-a1b2c3",
+          "status": "closed"
+        }
+      },
+
+      "command_mapping": {
+        "command_class": "CloseSessionCommand",
+        "mapping": {
+          "session_id": "path parameter session_id",
+          "user_id": "request.user_id"
+        }
+      },
+
+      "error_map": [
+        {
+          "exception": "SessionNotFoundError",
+          "module": "close_session_use_case",
+          "http_status": 404,
+          "error_code": "SESSION_NOT_FOUND",
+          "message": "Session not found"
+        },
+        {
+          "exception": "AuthorizationError",
+          "module": "close_session_use_case",
+          "http_status": 403,
+          "error_code": "AUTHORIZATION_ERROR",
+          "message": "User does not own this session"
+        },
+        {
+          "exception": "InvalidSessionTransitionError",
+          "module": "conversation_session (domain)",
+          "http_status": 409,
+          "error_code": "INVALID_STATE_TRANSITION",
+          "message": "Session cannot be closed in its current state"
+        }
+      ]
+    }
+
+  ],
+
+  "exception_handler_registry": {
+    "description": "All exception handlers are registered at app level in app.py. Route handlers never catch exceptions. The registration order is: specific exceptions first, then broader base classes.",
+    "handlers": [
+      {
+        "exception_class": "SessionConflictError",
+        "http_status": 409,
+        "error_code": "SESSION_CONFLICT"
+      },
+      {
+        "exception_class": "UserNotFoundError",
+        "http_status": 404,
+        "error_code": "USER_NOT_FOUND"
+      },
+      {
+        "exception_class": "SchoolNotFoundError",
+        "http_status": 404,
+        "error_code": "SCHOOL_NOT_FOUND"
+      },
+      {
+        "exception_class": "SessionNotFoundError",
+        "http_status": 404,
+        "error_code": "SESSION_NOT_FOUND",
+        "note": "Raised by both process_turn_use_case and close_session_use_case — same HTTP mapping in both cases"
+      },
+      {
+        "exception_class": "InvalidTurnStateError",
+        "http_status": 422,
+        "error_code": "INVALID_SESSION_STATE"
+      },
+      {
+        "exception_class": "SessionOwnershipError",
+        "http_status": 403,
+        "error_code": "OWNERSHIP_MISMATCH"
+      },
+      {
+        "exception_class": "AuthorizationError",
+        "http_status": 403,
+        "error_code": "AUTHORIZATION_ERROR"
+      },
+      {
+        "exception_class": "InvalidSessionTransitionError",
+        "http_status": 409,
+        "error_code": "INVALID_STATE_TRANSITION"
+      }
+    ],
+    "error_response_envelope": {
+      "schema_name": "ErrorResponse",
+      "fields": [
+        { "name": "error_code", "type": "str" },
+        { "name": "message", "type": "str" }
+      ],
+      "example": {
+        "error_code": "SESSION_NOT_FOUND",
+        "message": "Session 'sess-a1b2c3' not found."
+      }
+    }
+  },
+
+  "app_startup": {
+    "description": "The FastAPI app is created by the factory function create_app() in app.py. The composition root (build_container) is called once during startup — all use case instances are shared across requests. The ASGI entry point is main.py at the workspace root.",
+    "startup_sequence": [
+      "1. main.py is loaded by the ASGI server (uvicorn)",
+      "2. create_app() is called: build_container() instantiates all infrastructure and use cases",
+      "3. Exception handlers are registered on the FastAPI app instance",
+      "4. The API router (with all 3 route handlers) is included in the app",
+      "5. FastAPI is ready to serve requests"
+    ],
+    "run_command": "uvicorn main:app --host 0.0.0.0 --port 8000 --reload"
+  },
+
+  "scope_boundary": {
+    "in_scope": [
+      "Three REST endpoints: POST /sessions, POST /sessions/{session_id}/turns, DELETE /sessions/{session_id}",
+      "Pydantic request and response schemas in src/shell/api/schemas.py",
+      "FastAPI app factory in src/shell/api/app.py with exception handler registration",
+      "Router module in src/shell/api/router.py with three route handler functions",
+      "ASGI entry point in main.py at workspace root",
+      "Exception-to-HTTP-status mapping for all use-case exceptions"
+    ],
+    "out_of_scope": [
+      "Authentication / JWT validation — user_id is treated as pre-resolved trusted identity",
+      "Rate limiting — not required at prototype scope",
+      "CORS configuration — not required unless a browser client is added",
+      "GraphQL, CLI, or webhook entry points — REST is the sole delivery channel",
+      "Health check endpoint — optional; not required by the deliverable",
+      "Background tasks or async processing — pipeline is synchronous"
+    ]
+  }
+}

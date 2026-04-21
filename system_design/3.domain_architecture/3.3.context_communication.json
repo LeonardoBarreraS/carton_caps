@@ -1,0 +1,255 @@
+{
+  "system": "Carton Caps Conversational Assistant",
+  "version": "1.0",
+  "phase": "3 — Domain-Driven Architecture",
+  "task": "Context Communication Design",
+  "derived_from": ["bounded_contexts.json", "components.json", "layered_architecture.json", "system_workflows.json"],
+
+  "communication_model": {
+    "type": "Synchronous Direct Interface Calls via Ports",
+    "rationale": "The RAG pipeline is inherently synchronous: evidence must be retrieved before a response can be generated. Async event-driven communication between contexts would introduce unnecessary complexity without benefit. All cross-context calls return values that are required to proceed. Domain events exist within each component as intra-component signals — they do not serve as cross-context triggers.",
+    "anti_corruption": "Translators (DTOs) sit at each context boundary. No domain object from one component's domain layer is ever imported into another component's domain layer. Every cross-context payload is a plain data transfer object carrying only what the receiving context needs."
+  },
+
+  "cross_context_channels": [
+    {
+      "id": "COMM-1",
+      "from_component": "COMP-1",
+      "from_context": "Conversation Management",
+      "to_component": "COMP-2",
+      "to_context": "Decision Intelligence",
+      "communication_type": "direct_interface_call",
+      "direction": "synchronous — caller blocks until result is returned",
+      "trigger_workflows": ["WF0", "WF1"],
+
+      "port": {
+        "name": "IDecisionIntelligenceService",
+        "defined_in": "src/conversation_management/application/ports/",
+        "owned_by": "COMP-1",
+        "rationale": "The port interface lives in the caller's application layer. COMP-1 owns the contract — it defines what it needs, not how COMP-2 works inside.",
+        "methods": [
+          {
+            "name": "preSeedContext",
+            "called_by": "StartSessionUseCase",
+            "input_dto": "PreSeedContextDTO",
+            "output": "void",
+            "when": "Once per session, during session initialization, before the first turn"
+          },
+          {
+            "name": "processTurn",
+            "called_by": "ProcessTurnUseCase",
+            "input_dto": "TurnInputDTO",
+            "output_dto": "TurnIntelligenceResultDTO",
+            "when": "Every conversation turn, after intent classification"
+          }
+        ]
+      },
+
+      "adapter": {
+        "name": "DecisionIntelligenceAdapter",
+        "location": "src/shell/composition/adapters/",
+        "implements": "IDecisionIntelligenceService",
+        "imports_from": ["COMP-1 application (port interface)", "COMP-2 application (use cases)"],
+        "rationale": "The adapter lives in the shell — the only module permitted to import across component boundaries. It delegates to COMP-2 use cases and translates between COMP-1 DTOs and COMP-2 use case inputs/outputs.",
+        "wired_in": "Container (src/shell/composition/)"
+      },
+
+      "translators": [
+        {
+          "name": "PreSeedContextDTO",
+          "direction": "COMP-1 → COMP-2",
+          "location": "src/conversation_management/application/ports/",
+          "fields": [
+            { "field": "session_id", "type": "string", "source": "ConversationSession identity" },
+            { "field": "school_id", "type": "string", "source": "School entity loaded at session init" },
+            { "field": "school_name", "type": "string", "source": "School entity loaded at session init" },
+            { "field": "purchase_signals", "type": "list[string]", "source": "PurchaseHistory (optional — empty list if no records)" }
+          ],
+          "note": "COMP-1 extracts only what COMP-2 needs to seed a DecisionContext. No School entity object crosses the boundary."
+        },
+        {
+          "name": "TurnInputDTO",
+          "direction": "COMP-1 → COMP-2",
+          "location": "src/conversation_management/application/ports/",
+          "fields": [
+            { "field": "session_id",                    "type": "string",        "source": "Active ConversationSession" },
+            { "field": "intent",                        "type": "string",        "source": "Intent value object (string representation)" },
+            { "field": "message",                       "type": "string",        "source": "Raw user message text" },
+            { "field": "turn_number",                   "type": "int",           "source": "session.turn_count + 1 at time of invocation" },
+            { "field": "conversation_history",  "type": "list[dict]", "source": "Full conversation history loaded by ProcessTurnUseCase from IConversationHistoryRepository.find_by_user_id(). Each entry is {\"role\": \"user\"|\"assistant\", \"content\": str}. Empty list if this is the first turn.", "note": "Passed to BC-2 so all LLM calls (ISignalExtractor, IIntentClassifier, IResponseGenerator, etc.) receive full conversational context (Proposal B — explicit history injection)." }
+          ],
+          "note": "Intent is passed as its string value — not as the Intent value object from COMP-1 domain. conversation_history enables full context-aware LLM calls across all pipeline nodes in BC-2."
+        },
+        {
+          "name": "TurnIntelligenceResultDTO",
+          "direction": "COMP-2 → COMP-1",
+          "location": "src/conversation_management/application/ports/",
+          "fields": [
+            { "field": "evidence_chunks", "type": "list[string]", "source": "RetrievedEvidence content from COMP-3" },
+            { "field": "evidence_type", "type": "string", "source": "product_evidence | referral_rule_evidence" },
+            { "field": "context_recall_score", "type": "float", "source": "Evaluated by COMP-2 IEvidenceEvaluator" },
+            { "field": "context_precision_score", "type": "float", "source": "Evaluated by COMP-2 IEvidenceEvaluator" },
+            { "field": "context_state", "type": "string", "source": "DecisionContext current state: empty|partial|ready|enriched" },
+            { "field": "clarification_needed", "type": "boolean", "source": "GapDetected result from COMP-2 domain" },
+            { "field": "clarification_question", "type": "string | null", "source": "Suggested question if clarification_needed is true" }
+          ],
+          "note": "No DecisionContext or PreferenceSignal objects cross into COMP-1. COMP-1 receives exactly what it needs to generate and evaluate a response."
+        }
+      ]
+    },
+
+    {
+      "id": "COMM-2",
+      "from_component": "COMP-2",
+      "from_context": "Decision Intelligence",
+      "to_component": "COMP-3",
+      "to_context": "Knowledge Retrieval",
+      "communication_type": "direct_interface_call",
+      "direction": "synchronous — caller blocks until evidence is returned",
+      "trigger_workflows": ["WF2", "WF3"],
+
+      "port": {
+        "name": "IKnowledgeRetrievalService",
+        "defined_in": "src/decision_intelligence/application/ports/",
+        "owned_by": "COMP-2",
+        "rationale": "COMP-2 owns the contract. It defines what retrieval it needs — COMP-3 fulfills it without knowing anything about DecisionContext.",
+        "methods": [
+          {
+            "name": "retrieve",
+            "called_by": "ProcessTurnIntelligenceUseCase",
+            "input_dto": "RetrievalQueryDTO",
+            "output_dto": "RetrievedEvidenceDTO",
+            "when": "When DecisionContext has product_inquiry or referral_question intent and context is partial/ready/enriched"
+          }
+        ]
+      },
+
+      "adapter": {
+        "name": "KnowledgeRetrievalAdapter",
+        "location": "src/shell/composition/adapters/",
+        "implements": "IKnowledgeRetrievalService",
+        "imports_from": ["COMP-2 application (port interface)", "COMP-3 application (use cases)"],
+        "rationale": "Lives in shell for the same reason as DecisionIntelligenceAdapter — cross-component import isolation. Delegates to COMP-3 ExecuteRetrievalUseCase.",
+        "wired_in": "Container (src/shell/composition/)"
+      },
+
+      "translators": [
+        {
+          "name": "RetrievalQueryDTO",
+          "direction": "COMP-2 → COMP-3",
+          "location": "src/decision_intelligence/application/ports/",
+          "fields": [
+            { "field": "query_text", "type": "string", "source": "RetrievalQuery.constructed_text" },
+            { "field": "source_target", "type": "string", "source": "RetrievalQuery.source_target — product_catalog | referral_program_rules" }
+          ],
+          "note": "The RetrievalQuery entity (COMP-2 domain) is never passed to COMP-3. Only its essential data is translated into this DTO."
+        },
+        {
+          "name": "RetrievedEvidenceDTO",
+          "direction": "COMP-3 → COMP-2",
+          "location": "src/decision_intelligence/application/ports/",
+          "fields": [
+            { "field": "chunks", "type": "list[string]", "source": "Top-matching content from vector store" },
+            { "field": "evidence_type", "type": "string", "source": "product_evidence | referral_rule_evidence" }
+          ],
+          "note": "COMP-3 returns raw retrieved content. COMP-2 maps this into its own RetrievedEvidence value object and runs quality evaluation before passing upstream."
+        }
+      ]
+    }
+  ],
+
+  "domain_events": {
+    "scope": "intra_component_only",
+    "rationale": "Domain events in this system are signals within a component's own domain. They do not drive cross-context communication. The GapDetected signal from COMP-2 travels back to COMP-1 as a field in TurnIntelligenceResultDTO — not as an event crossing contexts. In the synchronous RAG monolith there is no benefit to async event dispatch for the core pipeline. The shell layer drains these events and writes them to a structured log file for observability.",
+    "events_by_component": [
+      {
+        "component": "COMP-1",
+        "events": [
+          { "name": "SessionStarted", "scope": "intra-component", "published_by": "StartSessionUseCase", "logged_by": "shell/composition/LoggingEventPublisher -> data/domain_events.log" },
+          { "name": "TurnProcessed", "scope": "intra-component", "published_by": "ProcessTurnUseCase", "logged_by": "shell/composition/LoggingEventPublisher -> data/domain_events.log" },
+          { "name": "SessionClosed", "scope": "intra-component", "published_by": "CloseSessionUseCase", "logged_by": "shell/composition/LoggingEventPublisher -> data/domain_events.log" }
+        ]
+      },
+      {
+        "component": "COMP-2",
+        "events": [
+          { "name": "ContextUpdated", "scope": "intra-component", "published_by": "ProcessTurnIntelligenceUseCase", "logged_by": "shell/composition/LoggingEventPublisher -> data/domain_events.log" },
+          { "name": "GapDetected", "scope": "intra-component", "published_by": "ProcessTurnIntelligenceUseCase", "logged_by": "shell/composition/LoggingEventPublisher -> data/domain_events.log", "surfaced_as": "clarification_needed field in TurnIntelligenceResultDTO returned to COMP-1" },
+          { "name": "ContextReady", "scope": "intra-component", "published_by": "ProcessTurnIntelligenceUseCase", "logged_by": "shell/composition/LoggingEventPublisher -> data/domain_events.log" }
+        ]
+      }
+    ]
+  },
+
+  "adapter_layer_summary": {
+    "location": "src/shell/composition/adapters/",
+    "adapters": [
+      {
+        "name": "DecisionIntelligenceAdapter",
+        "implements": "IDecisionIntelligenceService (COMP-1 application)",
+        "delegates_to": ["PreSeedContextUseCase (COMP-2)", "ProcessTurnIntelligenceUseCase (COMP-2)"],
+        "translation_responsibility": "Maps PreSeedContextDTO → COMP-2 use case inputs. Maps COMP-2 use case outputs → TurnIntelligenceResultDTO."
+      },
+      {
+        "name": "KnowledgeRetrievalAdapter",
+        "implements": "IKnowledgeRetrievalService (COMP-2 application)",
+        "delegates_to": ["ExecuteRetrievalUseCase (COMP-3)"],
+        "translation_responsibility": "Maps RetrievalQueryDTO → COMP-3 use case input. Maps COMP-3 use case output → RetrievedEvidenceDTO."
+      }
+    ],
+    "wiring": "Container instantiates both adapters and injects them into COMP-1 and COMP-2 application use cases via constructor injection at startup."
+  },
+
+  "communication_flow": {
+    "per_turn_sequence": [
+      "1. shell/api receives HTTP request → calls ProcessTurnUseCase (COMP-1)",
+      "2. ProcessTurnUseCase classifies intent via IIntentClassifier (COMP-1 infra)",
+      "3. ProcessTurnUseCase calls IDecisionIntelligenceService.processTurn(TurnInputDTO) → DecisionIntelligenceAdapter",
+      "4. DecisionIntelligenceAdapter calls ProcessTurnIntelligenceUseCase (COMP-2)",
+      "5. ProcessTurnIntelligenceUseCase extracts signals, updates DecisionContext, builds RetrievalQuery",
+      "6. ProcessTurnIntelligenceUseCase calls IKnowledgeRetrievalService.retrieve(RetrievalQueryDTO) → KnowledgeRetrievalAdapter",
+      "7. KnowledgeRetrievalAdapter calls ExecuteRetrievalUseCase (COMP-3)",
+      "8. ExecuteRetrievalUseCase executes vector store retrieval, returns RetrievedEvidenceDTO",
+      "9. KnowledgeRetrievalAdapter returns RetrievedEvidenceDTO to COMP-2",
+      "10. ProcessTurnIntelligenceUseCase evaluates evidence quality, returns TurnIntelligenceResultDTO",
+      "11. DecisionIntelligenceAdapter returns TurnIntelligenceResultDTO to COMP-1",
+      "12. ProcessTurnUseCase generates response, evaluates scores, returns AssistantResponse to shell"
+    ],
+    "session_init_sequence": [
+      "1. shell/api receives session start request → calls StartSessionUseCase (COMP-1)",
+      "2. StartSessionUseCase loads User, School, ConversationHistory, PurchaseHistory",
+      "3. StartSessionUseCase calls IDecisionIntelligenceService.preSeedContext(PreSeedContextDTO)",
+      "4. DecisionIntelligenceAdapter calls PreSeedContextUseCase (COMP-2)",
+      "5. PreSeedContextUseCase creates DecisionContext with school anchor + purchase signals",
+      "6. Session transitions to active state — ready for first turn"
+    ]
+  },
+
+  "boundary_rules": [
+    "No domain object from any component's domain layer crosses a context boundary",
+    "Every cross-context payload is a plain DTO defined adjacent to the port interface it serves",
+    "Port interfaces are owned by the caller (defined in caller's application layer)",
+    "Adapters that bridge contexts live exclusively in src/shell/composition/adapters/",
+    "No component's application or domain layer imports from another component's domain layer",
+    "GapDetected is a domain signal internal to COMP-2 — it surfaces as a DTO field, never as a cross-context event"
+  ],
+
+  "ingestion_boundary": {
+    "description": "COMP-5 (knowledge_ingestion) shares a storage contract with COMP-3 (knowledge_retrieval) through the vector store. This is a one-directional, offline-to-runtime relationship — not a runtime communication channel.",
+    "write_side": {
+      "component": "COMP-5",
+      "module": "src/ingestion",
+      "writes_collections": ["product_catalog", "referral_program_rules"],
+      "when": "Run once before system startup, or re-run when catalog or referral documents change"
+    },
+    "read_side": {
+      "component": "COMP-3",
+      "module": "src/knowledge_retrieval",
+      "reads_collections": ["product_catalog", "referral_program_rules"],
+      "via": ["ProductVectorStoreRepository", "ReferralRuleVectorStoreRepository"],
+      "when": "Every conversation turn that triggers a retrieval query"
+    },
+    "coupling_type": "shared persistent storage — no code import between COMP-5 and any runtime component (COMP-1 through COMP-4)",
+    "isolation_rule": "COMP-5 is never imported by the runtime container. It has its own composition root (run_ingestion.py) and is invoked exclusively from the command line."
+  }
+}

@@ -1,0 +1,393 @@
+{
+  "system": "Carton Caps Conversational Assistant",
+  "version": "1.0",
+  "phase": "7 — Shell / Composition Layer",
+  "task": "Context Wiring",
+  "derived_from": [
+    "event_bus.json",
+    "context_coordination.json",
+    "context_communication.json",
+    "dependency_wiring.json",
+    "bounded_contexts.json",
+    "use_cases.json"
+  ],
+  "wiring_location": "src/shell/composition/",
+
+  "design_principles": [
+    "Contexts are isolated — no bounded context imports from another bounded context",
+    "All cross-context interaction crosses through port interfaces defined in the calling context's application layer",
+    "Shell adapters are the exclusive physical bridges between bounded contexts — they are the only modules that import across BC boundaries",
+    "Domain events are intra-context signals — they do not drive cross-context behavior and are not routed between contexts",
+    "Each context's event publisher port is wired to the same shared LoggingEventPublisher shell implementation — events flow to the observability sink, not to other contexts",
+    "The wiring connection between two contexts is a synchronous call-response cycle, not an async event — this matches the RAG pipeline's inherent sequential structure",
+    "Context isolation is enforced structurally: the shell is the only layer permitted to import from multiple bounded contexts simultaneously"
+  ],
+
+  "wiring_model": {
+    "cross_context_mechanism": "synchronous_adapter_port_calls",
+    "intra_context_event_mechanism": "drain_and_publish_to_observability_sink",
+    "rationale": "The RAG pipeline flows: classify intent → extract signals and retrieve evidence → generate and evaluate response. Each step depends on the previous result. Cross-context synchronous calls via port interfaces match this sequential dependency exactly. Domain events in all three contexts are observability records — they document what happened for audit and analysis. They carry no behavioral consequence for any other context and require no event routing infrastructure.",
+    "no_event_subscriptions": "There are no cross-context event handlers in this system. The context-wiring skill template prescribes event_bus.subscribe() as its primary pattern. This system uses synchronous adapter port calls instead — a deliberate architectural decision recorded in context_communication.json. The absence of event subscriptions is correct, not an omission."
+  },
+
+  "contexts": [
+    {
+      "id": "BC-1",
+      "name": "conversation_management",
+      "module": "src/conversation_management/",
+      "role": "primary driver — owns session lifecycle, turn orchestration, user intent classification, response generation and evaluation, and the public API surface",
+      "cross_context_ports_outbound": [
+        {
+          "port": "IDecisionIntelligenceService",
+          "location": "src/conversation_management/application/ports/i_decision_intelligence_service.py",
+          "connects_to": "BC-2",
+          "mechanism": "synchronous port call via DecisionIntelligenceAdapter"
+        }
+      ],
+      "cross_context_ports_inbound": [],
+      "intra_context_events_emitted": [
+        {
+          "event": "SessionStarted",
+          "emitted_by": "ConversationSession.complete_initialization()",
+          "drained_by": "StartSessionUseCase",
+          "published_to": "LoggingEventPublisher (observability sink)"
+        },
+        {
+          "event": "TurnProcessed",
+          "emitted_by": "ConversationSession.complete_turn()",
+          "drained_by": "ProcessTurnUseCase",
+          "published_to": "LoggingEventPublisher (observability sink)"
+        },
+        {
+          "event": "SessionClosed",
+          "emitted_by": "ConversationSession.close()",
+          "drained_by": "CloseSessionUseCase",
+          "published_to": "LoggingEventPublisher (observability sink)"
+        }
+      ],
+      "event_publisher_port": {
+        "port": "IEventPublisher",
+        "location": "src/conversation_management/application/ports/i_event_publisher.py",
+        "wired_to": "LoggingEventPublisher"
+      }
+    },
+    {
+      "id": "BC-2",
+      "name": "decision_intelligence",
+      "module": "src/decision_intelligence/",
+      "role": "reasoning engine — owns DecisionContext lifecycle, preference signal extraction, context readiness evaluation, retrieval query construction, and evidence quality evaluation",
+      "cross_context_ports_outbound": [
+        {
+          "port": "IKnowledgeRetrievalService",
+          "location": "src/decision_intelligence/application/ports/i_knowledge_retrieval_service.py",
+          "connects_to": "BC-3",
+          "mechanism": "synchronous port call via KnowledgeRetrievalAdapter"
+        }
+      ],
+      "cross_context_ports_inbound": [
+        {
+          "port": "IDecisionIntelligenceService",
+          "defined_in": "BC-1",
+          "bridged_by": "DecisionIntelligenceAdapter",
+          "inbound_callers": ["StartSessionUseCase (pre_seed_context)", "ProcessTurnUseCase (process_turn)"]
+        }
+      ],
+      "intra_context_events_emitted": [
+        {
+          "event": "ContextUpdated",
+          "emitted_by": "DecisionContext.add_signal()",
+          "drained_by": "ProcessTurnIntelligenceUseCase",
+          "published_to": "LoggingEventPublisher (observability sink)",
+          "note": "Emitted on every signal-adding turn"
+        },
+        {
+          "event": "GapDetected",
+          "emitted_by": "DecisionContext.record_gap_evaluation()",
+          "drained_by": "ProcessTurnIntelligenceUseCase",
+          "published_to": "LoggingEventPublisher (observability sink)",
+          "note": "Conditional — only when context gaps are detected. The behavioral consequence (clarification_needed=true) travels via TurnIntelligenceResultDTO, not via this event."
+        },
+        {
+          "event": "ContextReady",
+          "emitted_by": "DecisionContext.mark_ready()",
+          "drained_by": "ProcessTurnIntelligenceUseCase",
+          "published_to": "LoggingEventPublisher (observability sink)",
+          "note": "Emitted once — on first transition to ready state"
+        }
+      ],
+      "event_publisher_port": {
+        "port": "IEventPublisher",
+        "location": "src/decision_intelligence/application/ports/i_event_publisher.py",
+        "wired_to": "LoggingEventPublisher"
+      }
+    },
+    {
+      "id": "BC-3",
+      "name": "knowledge_retrieval",
+      "module": "src/knowledge_retrieval/",
+      "role": "semantic search — owns vector store queries for the product catalog and referral program rules",
+      "cross_context_ports_outbound": [],
+      "cross_context_ports_inbound": [
+        {
+          "port": "IKnowledgeRetrievalService",
+          "defined_in": "BC-2",
+          "bridged_by": "KnowledgeRetrievalAdapter",
+          "inbound_callers": ["ProcessTurnIntelligenceUseCase (retrieve)"]
+        }
+      ],
+      "intra_context_events_emitted": [],
+      "event_publisher_port": null,
+      "note": "BC-3 is a pure service provider — it answers retrieval requests and emits no domain events. It has no outbound cross-context dependencies."
+    }
+  ],
+
+  "events": {
+    "scope": "intra_context_only",
+    "cross_context_routing": false,
+    "explanation": "All six domain events are observability signals. None trigger business logic in any other bounded context. The communication link between contexts is a synchronous port call, not an event. Events document facts after they occur; port calls request results before the caller can proceed.",
+    "event_registry": [
+      {
+        "event": "SessionStarted",
+        "bounded_context": "BC-1",
+        "module": "src/conversation_management/domain/events/session_started.py",
+        "crosses_context_boundary": false,
+        "consumer": "LoggingEventPublisher → data/domain_events.log"
+      },
+      {
+        "event": "TurnProcessed",
+        "bounded_context": "BC-1",
+        "module": "src/conversation_management/domain/events/turn_processed.py",
+        "crosses_context_boundary": false,
+        "consumer": "LoggingEventPublisher → data/domain_events.log"
+      },
+      {
+        "event": "SessionClosed",
+        "bounded_context": "BC-1",
+        "module": "src/conversation_management/domain/events/session_closed.py",
+        "crosses_context_boundary": false,
+        "consumer": "LoggingEventPublisher → data/domain_events.log"
+      },
+      {
+        "event": "ContextUpdated",
+        "bounded_context": "BC-2",
+        "module": "src/decision_intelligence/domain/events/context_updated.py",
+        "crosses_context_boundary": false,
+        "consumer": "LoggingEventPublisher → data/domain_events.log"
+      },
+      {
+        "event": "GapDetected",
+        "bounded_context": "BC-2",
+        "module": "src/decision_intelligence/domain/events/gap_detected.py",
+        "crosses_context_boundary": false,
+        "consumer": "LoggingEventPublisher → data/domain_events.log"
+      },
+      {
+        "event": "ContextReady",
+        "bounded_context": "BC-2",
+        "module": "src/decision_intelligence/domain/events/context_ready.py",
+        "crosses_context_boundary": false,
+        "consumer": "LoggingEventPublisher → data/domain_events.log"
+      }
+    ]
+  },
+
+  "handlers": {
+    "cross_context_handlers": [],
+    "cross_context_handlers_count": 0,
+    "explanation": "There are no cross-context event handlers in this system. The skill template's subscribe/handler pattern applies when a context needs to react to an event from another context with business logic. In this system, no such reactive behavior exists between contexts: BC-2 does not react to BC-1 events, and BC-3 does not react to BC-2 events. Contexts interact exclusively through synchronous call-response cycles. Introducing handlers would require an async dispatch infrastructure with no behavioral consumer to justify the complexity.",
+    "intra_context_event_consumers": [
+      {
+        "context": "BC-1 + BC-2",
+        "consumer": "LoggingEventPublisher",
+        "role": "observability drain — the single consumer of all domain events from both contexts",
+        "type": "infrastructure_sink",
+        "location": "src/shell/composition/logging_event_publisher.py",
+        "note": "LoggingEventPublisher is not a handler in the behavioral sense — it does not execute business logic in response to events. It is an observability sink. It implements both BC-1 and BC-2 IEventPublisher ports via multiple inheritance."
+      }
+    ]
+  },
+
+  "wiring": {
+    "cross_context_connections": [
+      {
+        "id": "WIRE-CC-1",
+        "label": "COMM-1",
+        "from_context": "BC-1 (conversation_management)",
+        "to_context": "BC-2 (decision_intelligence)",
+        "mechanism": "synchronous port call",
+        "port": "IDecisionIntelligenceService",
+        "port_owner": "BC-1",
+        "adapter": "DecisionIntelligenceAdapter",
+        "adapter_location": "src/shell/composition/adapters/decision_intelligence_adapter.py",
+        "calls": [
+          {
+            "method": "pre_seed_context(PreSeedContextDTO) → None",
+            "triggered_by": "StartSessionUseCase",
+            "trigger_event": "session initialization",
+            "frequency": "once per session",
+            "blocking": true
+          },
+          {
+            "method": "process_turn(TurnInputDTO) → TurnIntelligenceResultDTO",
+            "triggered_by": "ProcessTurnUseCase via TurnGraph (process_decision_intelligence node)",
+            "trigger_event": "every conversation turn, after intent classification",
+            "frequency": "once per turn",
+            "blocking": true
+          }
+        ],
+        "dto_boundary": {
+          "inbound_dtos": ["PreSeedContextDTO", "TurnInputDTO"],
+          "outbound_dtos": ["TurnIntelligenceResultDTO"],
+          "rule": "No BC-1 domain objects cross into BC-2. No BC-2 domain objects return to BC-1. Only primitives travel in DTOs."
+        }
+      },
+      {
+        "id": "WIRE-CC-2",
+        "label": "COMM-2",
+        "from_context": "BC-2 (decision_intelligence)",
+        "to_context": "BC-3 (knowledge_retrieval)",
+        "mechanism": "synchronous port call",
+        "port": "IKnowledgeRetrievalService",
+        "port_owner": "BC-2",
+        "adapter": "KnowledgeRetrievalAdapter",
+        "adapter_location": "src/shell/composition/adapters/knowledge_retrieval_adapter.py",
+        "calls": [
+          {
+            "method": "retrieve(RetrievalQueryDTO) → RetrievedEvidenceDTO",
+            "triggered_by": "ProcessTurnIntelligenceUseCase via DecisionIntelligenceSubgraph (execute_retrieval node)",
+            "trigger_event": "when DecisionContext is ready/enriched and intent is product_inquiry or referral_inquiry",
+            "frequency": "0–N per turn (conditional on context readiness and intent; includes retry cycle on low evidence recall)",
+            "blocking": true
+          }
+        ],
+        "dto_boundary": {
+          "inbound_dtos": ["RetrievalQueryDTO"],
+          "outbound_dtos": ["RetrievedEvidenceDTO"],
+          "rule": "No BC-2 domain objects (DecisionContext, RetrievalQuery) cross into BC-3. BC-3 is a pure retrieval service."
+        }
+      }
+    ],
+    "intra_context_event_wiring": [
+      {
+        "id": "WIRE-EVT-1",
+        "context": "BC-1",
+        "events": ["SessionStarted", "TurnProcessed", "SessionClosed"],
+        "publisher_port": "IEventPublisher (BC-1)",
+        "publisher_implementation": "LoggingEventPublisher",
+        "sink": "data/domain_events.log",
+        "wired_in": "build_container() → event_publisher = LoggingEventPublisher(log_path=...)"
+      },
+      {
+        "id": "WIRE-EVT-2",
+        "context": "BC-2",
+        "events": ["ContextUpdated", "GapDetected", "ContextReady"],
+        "publisher_port": "IEventPublisher (BC-2)",
+        "publisher_implementation": "LoggingEventPublisher",
+        "sink": "data/domain_events.log",
+        "wired_in": "build_container() — same LoggingEventPublisher instance as WIRE-EVT-1"
+      }
+    ]
+  },
+
+  "topology": {
+    "description": "The inter-context topology is a linear call chain: BC-1 drives the full conversation turn, invoking BC-2 for intelligence and BC-3 (via BC-2) for retrieval. BC-3 is a leaf service with no outbound dependencies. All event flows terminate at the local observability sink.",
+    "diagram": [
+      "API / HTTP",
+      "    ↓ (HTTP request)",
+      "BC-1 ConversationManagement",
+      "    ↓ COMM-1: IDecisionIntelligenceService → DecisionIntelligenceAdapter",
+      "BC-2 DecisionIntelligence",
+      "    ↓ COMM-2: IKnowledgeRetrievalService → KnowledgeRetrievalAdapter",
+      "BC-3 KnowledgeRetrieval (Qdrant)",
+      "",
+      "BC-1 domain events (SessionStarted, TurnProcessed, SessionClosed)",
+      "    → IEventPublisher (BC-1) → LoggingEventPublisher → domain_events.log",
+      "",
+      "BC-2 domain events (ContextUpdated, GapDetected, ContextReady)",
+      "    → IEventPublisher (BC-2) → LoggingEventPublisher → domain_events.log"
+    ],
+    "isolation_guarantee": "No bounded context module imports from another bounded context module. BC-1 sees only IDecisionIntelligenceService. BC-2 sees only IKnowledgeRetrievalService. BC-3 sees no other contexts. The shell composition layer is the sole exception — it imports from all three to wire them."
+  },
+
+  "coordinators": [
+    {
+      "id": "COORD-1",
+      "name": "SessionInitializationCoordinator",
+      "realization": "embedded in StartSessionUseCase (UC-1)",
+      "contexts_spanned": ["BC-1", "BC-2"],
+      "wiring": "StartSessionUseCase calls IDecisionIntelligenceService.pre_seed_context(PreSeedContextDTO) → DecisionIntelligenceAdapter → PreSeedContextUseCase",
+      "shell_connection": "WIRE-CC-1 (pre_seed_context method)"
+    },
+    {
+      "id": "COORD-2",
+      "name": "ConversationTurnCoordinator",
+      "realization": "embedded in TurnGraph (WF-GRAPH-1) inside ProcessTurnUseCase (UC-2)",
+      "contexts_spanned": ["BC-1", "BC-2", "BC-3"],
+      "wiring": [
+        "TurnGraph node 'process_decision_intelligence' calls IDecisionIntelligenceService.process_turn(TurnInputDTO) → DecisionIntelligenceAdapter → ProcessTurnIntelligenceUseCase",
+        "DecisionIntelligenceSubgraph node 'execute_retrieval' calls IKnowledgeRetrievalService.retrieve(RetrievalQueryDTO) → KnowledgeRetrievalAdapter → ExecuteRetrievalUseCase"
+      ],
+      "shell_connections": ["WIRE-CC-1 (process_turn method)", "WIRE-CC-2 (retrieve method)"]
+    }
+  ],
+
+  "wiring_summary_table": [
+    {
+      "id": "WIRE-CC-1",
+      "from": "BC-1",
+      "to": "BC-2",
+      "mechanism": "IDecisionIntelligenceService → DecisionIntelligenceAdapter",
+      "calls": "pre_seed_context, process_turn",
+      "dtos": "PreSeedContextDTO, TurnInputDTO → TurnIntelligenceResultDTO"
+    },
+    {
+      "id": "WIRE-CC-2",
+      "from": "BC-2",
+      "to": "BC-3",
+      "mechanism": "IKnowledgeRetrievalService → KnowledgeRetrievalAdapter",
+      "calls": "retrieve",
+      "dtos": "RetrievalQueryDTO → RetrievedEvidenceDTO"
+    },
+    {
+      "id": "WIRE-EVT-1",
+      "from": "BC-1 domain events",
+      "to": "LoggingEventPublisher",
+      "mechanism": "IEventPublisher (BC-1).publish(events)",
+      "calls": "publish",
+      "dtos": "list[SessionStarted | TurnProcessed | SessionClosed] → domain_events.log"
+    },
+    {
+      "id": "WIRE-EVT-2",
+      "from": "BC-2 domain events",
+      "to": "LoggingEventPublisher",
+      "mechanism": "IEventPublisher (BC-2).publish(events)",
+      "calls": "publish",
+      "dtos": "list[ContextUpdated | GapDetected | ContextReady] → domain_events.log"
+    }
+  ],
+
+  "skill_template_mapping": {
+    "contexts": ["BC-1 conversation_management", "BC-2 decision_intelligence", "BC-3 knowledge_retrieval"],
+    "events": ["SessionStarted", "TurnProcessed", "SessionClosed", "ContextUpdated", "GapDetected", "ContextReady"],
+    "handlers": "None — no cross-context behavioral handlers. The skill template's handler pattern applies when a context must react to another context's event. This system's RAG pipeline uses synchronous call-response instead of reactive event handling.",
+    "wiring_mechanism": "synchronous adapter port calls (COMM-1, COMM-2), not event subscriptions",
+    "rationale_for_deviation": "The skill template is optimized for event-driven systems where contexts react asynchronously. This system's pipeline is inherently synchronous and sequential: each step needs the result of the previous step before it can proceed. Direct synchronous port calls with DTOs are the correct mechanism. Event routing between contexts would invert the flow: instead of BC-1 requesting a result from BC-2, BC-1 would emit an event and wait for BC-2 to react — adding indirection and async complexity to a fundamentally blocking operation."
+  },
+
+  "wiring_rules": {
+    "must": [
+      "All cross-context wires are implemented as shell adapters in src/shell/composition/adapters/",
+      "Each cross-context port interface is defined exclusively in the calling context's application layer",
+      "DTOs used at context boundaries carry only primitives — no domain objects cross",
+      "The same LoggingEventPublisher instance is wired to IEventPublisher ports across all contexts",
+      "Context isolation verified: no BC module contains an import statement referencing another BC"
+    ],
+    "must_not": [
+      "No bounded context imports from another bounded context",
+      "No domain event is routed across a context boundary",
+      "No event subscription (event_bus.subscribe) between contexts — there are no cross-context handlers",
+      "No async event dispatch between contexts — the pipeline is synchronous",
+      "No LoggingEventPublisher logic may interpret event content or conditionally alter behavior"
+    ]
+  }
+}

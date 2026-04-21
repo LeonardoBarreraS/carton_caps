@@ -1,0 +1,176 @@
+{
+  "system": "Carton Caps Conversational Assistant",
+  "version": "1.0",
+  "phase": "3 — Domain-Driven Architecture",
+  "task": "Context-to-Component Mapping",
+  "derived_from": ["bounded_contexts.json"],
+  "deployment_model": "monolith",
+  "deployment_note": "All components run within a single deployable unit. Bounded context semantics are preserved through module isolation, not process isolation. No separate services, no separate processes.",
+
+  "components": [
+    {
+      "id": "COMP-1",
+      "name": "conversation_management",
+      "bounded_context": "BC-1",
+      "module_path": "src/conversation_management",
+      "orchestration_engine": "LangGraph — TurnGraph executes the turn pipeline inside ProcessTurnUseCase. Nodes call ports only. Domain logic stays in domain layer.",
+      "role": "Orchestrates the full conversation turn loop. Owns the session lifecycle from creation to close. Classifies intent on every turn. Loads user context at session start. Assembles and returns the grounded AssistantResponse to the API caller.",
+      "owns": {
+        "process_entities": ["ConversationSession"],
+        "entities": ["ConversationHistory"],
+        "value_objects": ["User", "School", "Intent", "AssistantResponse"]
+      },
+      "enforces_invariants": [
+        "INV-CS-1", "INV-CS-2", "INV-CS-3", "INV-CS-4", "INV-CS-5", "INV-CS-6", "INV-CS-7",
+        "INV-WF-1", "INV-WF-3", "INV-WF-4"
+      ],
+      "outbound_dependencies": [
+        {
+          "to": "COMP-2",
+          "payload": "classified Intent + current turn message",
+          "when": "Every turn after intent classification"
+        }
+      ],
+      "inbound_from": [
+        {
+          "from": "COMP-2",
+          "payload": "RetrievedEvidence",
+          "used_for": "Injecting grounded evidence into response generation"
+        }
+      ]
+    },
+    {
+      "id": "COMP-2",
+      "name": "decision_intelligence",
+      "bounded_context": "BC-2",
+      "module_path": "src/decision_intelligence",
+      "orchestration_engine": "LangGraph — DecisionIntelligenceSubgraph executes the decision pipeline inside ProcessTurnIntelligenceUseCase. Includes retrieval retry cycle and gap detection branch. Nodes call ports only.",
+      "role": "Accumulates preference signals monotonically across turns. Evaluates context readiness. Constructs an enriched RetrievalQuery from accumulated context — never from raw message. Routes the query to the correct knowledge source. Passes resulting evidence back to Conversation Management.",
+      "owns": {
+        "process_entities": ["DecisionContext"],
+        "entities": ["RetrievalQuery"],
+        "value_objects": ["PreferenceSignal", "RetrievedEvidence"]
+      },
+      "enforces_invariants": [
+        "INV-DC-1", "INV-DC-2", "INV-DC-3", "INV-DC-4", "INV-DC-5", "INV-DC-6",
+        "INV-RQ-1", "INV-RQ-2", "INV-RQ-3",
+        "INV-WF-2"
+      ],
+      "outbound_dependencies": [
+        {
+          "to": "COMP-3",
+          "payload": "RetrievalQuery (context-enriched, carrying source_target)",
+          "when": "When context is partial/ready/enriched with product_inquiry or referral_question intent"
+        }
+      ],
+      "inbound_from": [
+        {
+          "from": "COMP-1",
+          "payload": "classified Intent + current turn message"
+        },
+        {
+          "from": "COMP-3",
+          "payload": "RetrievedEvidence (top-matching results)"
+        }
+      ]
+    },
+    {
+      "id": "COMP-3",
+      "name": "knowledge_retrieval",
+      "bounded_context": "BC-3",
+      "module_path": "src/knowledge_retrieval",
+      "role": "Maintains the product catalog and referral program rules as semantically searchable knowledge sources. Executes retrieval for a given RetrievalQuery. Returns top-matching RetrievedEvidence. Does not invent or rewrite content — only retrieves.",
+      "owns": {
+        "entities": ["Product", "ReferralRule"],
+        "value_objects": ["RetrievedEvidence"]
+      },
+      "enforces_invariants": [
+        "INV-AR-1", "INV-AR-2", "INV-AR-3", "INV-AR-4"
+      ],
+      "outbound_dependencies": [],
+      "inbound_from": [
+        {
+          "from": "COMP-2",
+          "payload": "RetrievalQuery"
+        }
+      ]
+    },
+    {
+      "id": "COMP-4",
+      "name": "shell",
+      "bounded_context": null,
+      "module_path": "src/shell",
+      "role": "Entry points (API controllers) and composition root (dependency wiring). Owns no domain logic. Knows about all components — no component knows about shell. Bootstraps the application.",
+      "owns": {
+        "entry_points": ["REST API controllers"],
+        "wiring": ["Dependency injection / composition root", "LangGraph checkpointer (SQLite-backed) — wired here and injected into TurnGraph and DecisionIntelligenceSubgraph to enable optional cross-session graph state persistence"]
+      },
+      "enforces_invariants": [],
+      "outbound_dependencies": [
+        {
+          "to": "COMP-1",
+          "payload": "Inbound API request (user_id + message)",
+          "when": "On every API call"
+        }
+      ],
+      "inbound_from": []
+    },
+    {
+      "id": "COMP-5",
+      "name": "knowledge_ingestion",
+      "bounded_context": null,
+      "module_path": "src/ingestion",
+      "deployment": "offline CLI script — run once before system startup or whenever the product catalog or referral documents change",
+      "role": "Standalone ingestion pipeline. Reads product data from SQLite and referral rules from PDF documents. Semantically enriches and labels each record. Embeds and writes to the vector store collections that COMP-3 reads at query time. Never imported by or coupled to the runtime system.",
+      "owns": {
+        "pipelines": ["IngestProductCatalogUseCase", "IngestReferralRulesUseCase"]
+      },
+      "enforces_invariants": [],
+      "outbound_dependencies": [],
+      "inbound_from": [],
+      "shared_infrastructure": {
+        "writes_to": ["product_catalog (vector store)", "referral_program_rules (vector store)"],
+        "read_by": "COMP-3 reads the same collections at query time via ProductVectorStoreRepository and ReferralRuleVectorStoreRepository",
+        "coupling_type": "shared storage only — no code dependency between COMP-5 and any runtime component"
+      },
+      "architecture_note": "COMP-5 follows Clean Architecture internally (domain ports, application use cases, infrastructure adapters) but is fully isolated from COMP-1 through COMP-4. It is not wired into the runtime container."
+    }
+  ],
+
+  "dependency_graph": {
+    "direction": "strictly unidirectional",
+    "flow": "COMP-4 (shell) → COMP-1 → COMP-2 → COMP-3",
+    "evidence_return_flow": "COMP-3 returns evidence to COMP-2 as a function return value; COMP-2 passes it back to COMP-1 as a return value — not a reverse dependency",
+    "rules": [
+      "No bidirectional dependencies",
+      "No circular dependencies",
+      "Components communicate through defined interfaces (ports)",
+      "No component imports domain logic from another component's domain layer",
+      "shell is the only module allowed to import from multiple components simultaneously"
+    ]
+  },
+
+  "folder_structure": {
+    "root": "src/",
+    "modules": [
+      "src/conversation_management/",
+      "src/decision_intelligence/",
+      "src/knowledge_retrieval/",
+      "src/shell/",
+      "src/ingestion/"
+    ],
+    "notes": [
+      "Each domain module maps 1:1 to a bounded context",
+      "shell/ contains API entry points and the composition root — no domain logic",
+      "ingestion/ is a standalone offline pipeline — not a bounded context and not imported by any runtime module",
+      "Cross-context value objects (RetrievedEvidence, RetrievalQuery) flow as return values — not shared imports between domain layers"
+    ]
+  },
+
+  "context_map_validation": {
+    "all_bounded_contexts_mapped": true,
+    "shared_entities": "None — User and School are owned by COMP-1; referenced by COMP-2 only through the pre-seeded school anchor passed at session init",
+    "no_cross_domain_imports": true,
+    "rag_pipeline_preserved": "COMP-1 classifies intent → COMP-2 builds query → COMP-3 retrieves evidence → COMP-2 passes evidence → COMP-1 assembles response"
+  }
+}

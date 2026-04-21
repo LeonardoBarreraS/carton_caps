@@ -1,0 +1,6 @@
+# Ingestion pipeline dependencies
+# All dependencies are covered by the root requirements.txt.
+# Install from the project root: pip install -r requirements.txt
+#
+# This file lists only ingestion-specific packages not present in the root manifest.
+pdfplumber>=0.11.0

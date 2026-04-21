@@ -1,0 +1,191 @@
+{
+  "system": "Carton Caps Conversational Assistant",
+  "version": "1.0",
+  "purpose": "Stateful conversational fundraising co-pilot that learns user preferences and intent through dialogue and guides users toward product purchases and referral actions that increase school donations. It is a decision-guidance system, not a chatbot or Q&A system.",
+  "architecture_assumption": "User authentication and registration are handled by an existing external REST API. This service receives every request with a pre-resolved, trusted user_id. It does not handle authentication or registration.",
+  "actors": [
+    {
+      "id": "user",
+      "name": "User",
+      "description": "Authenticated parent or shopper — identity pre-resolved by the external REST API before reaching this service"
+    },
+    {
+      "id": "external_auth_api",
+      "name": "External Auth API",
+      "description": "Existing REST API handling authentication and new user registration. Out of scope for this service."
+    },
+    {
+      "id": "system",
+      "name": "System",
+      "description": "Conversational assistant that processes messages and generates responses"
+    },
+    {
+      "id": "knowledge_base",
+      "name": "Knowledge Base",
+      "description": "Product catalog and referral program rules available as a data source"
+    },
+    {
+      "id": "database",
+      "name": "Database",
+      "description": "Stores users, schools, products, conversation history, and purchase history"
+    }
+  ],
+  "functional_requirements": [
+    {
+      "id": "FR1",
+      "name": "Conversation Session Management",
+      "category": "Core",
+      "statement": "The system must initiate and maintain a conversation session that preserves context across multiple user turns.",
+      "session_initialization": "When a session starts, the system loads the authenticated user's profile, resolves their associated school, and loads their prior ConversationHistory from the database. This pre-seeds the DecisionContext with the school before any conversation turn begins.",
+      "architecture_assumption": "User identity is pre-resolved by the existing external REST API. Every request arrives with a trusted user_id. This service does not handle authentication or registration.",
+      "observable_behavior": "Each user message is processed within a continuous session. Prior messages influence subsequent responses. A returning user's prior conversation context is restored from the database. The first assistant response is already school-aware.",
+      "rationale": "Pre-seeding with school and history means the first response is already personalized. Without session continuity, context cannot accumulate."
+    },
+    {
+      "id": "FR2",
+      "name": "Intent Recognition",
+      "category": "Core",
+      "statement": "The system must classify the intent of each incoming user message before processing.",
+      "intent_types": [
+        {
+          "id": "product_inquiry",
+          "example": "What should I buy for my kids?"
+        },
+        {
+          "id": "referral_question",
+          "example": "How does the referral program work?"
+        },
+        {
+          "id": "general_question",
+          "example": "What is Carton Caps? / How does this service work?",
+          "note": "On-domain questions about Carton Caps, the service, or the fundraising program — not specifically about a product or referral mechanics."
+        },
+        {
+          "id": "clarification_response",
+          "example": "User answering a question the assistant asked"
+        },
+        {
+          "id": "ambiguous",
+          "example": "Unclear or mixed signals that could belong to multiple on-domain categories"
+        },
+        {
+          "id": "out_of_scope",
+          "example": "Tell me a joke / What's the weather? / This app is terrible",
+          "note": "Messages clearly unrelated to Carton Caps: jokes, random chat, complaints, account/billing claims, insults, or anything with no connection to grocery shopping, products, referrals, or fundraising. Routes to a polite scope-redirect response — no DI pipeline invoked."
+        }
+      ],
+      "observable_behavior": "A user message is classified first. The classification determines which system behavior is activated next. Out-of-scope messages receive a polite scope-redirect without triggering any retrieval or decision intelligence pipeline.",
+      "rationale": "Routing conversation to the correct capability requires knowing what the user wants. Adding out_of_scope prevents off-domain messages from incorrectly entering the retrieval pipeline and generating poor or fallback responses."
+    },
+    {
+      "id": "FR3",
+      "name": "Progressive Decision Context Construction",
+      "category": "Core",
+      "statement": "The system must extract preference signals from each user message and accumulate them into a structured decision context across the conversation.",
+      "context_captures": [
+        "product_preferences",
+        "family_context",
+        "fundraising_goals",
+        "expressed_constraints"
+      ],
+      "pre_seeded_at_session_start": [
+        {
+          "signal": "school",
+          "source": "user profile from database",
+          "note": "School is already known at session start. No need to ask the user."
+        },
+        {
+          "signal": "prior_conversation_signals",
+          "source": "ConversationHistory from database",
+          "note": "Loaded if the user has prior sessions. Enables context continuity across sessions."
+        },
+        {
+          "signal": "purchase_signals",
+          "source": "PurchaseHistory from database",
+          "note": "Optional. Currently empty. Skipped if empty. When populated, enriches retrieval queries with behavioral purchase data."
+        }
+      ],
+      "relationship_to_retrieval": "The accumulated decision context is the direct input to retrieval query construction. A richer context produces a more precise retrieval query, which produces more relevant evidence, which produces a better response. This is the core feedback loop of the system.",
+      "observable_behavior": "Each turn enriches the decision context. Later responses reflect all accumulated signals from previous turns. Retrieval quality improves as context grows.",
+      "rationale": "This transforms the assistant from a stateless chatbot into a decision co-pilot that learns the user across the conversation. It also makes every retrieval step smarter as the conversation progresses."
+    },
+    {
+      "id": "FR4",
+      "name": "Context-Enriched Knowledge Retrieval",
+      "category": "Core",
+      "statement": "The system must construct a retrieval query from the current intent and accumulated decision context, retrieve the most relevant knowledge from the appropriate source, and inject the retrieved evidence into the response generation step.",
+      "retrieval_pipeline": [
+        {
+          "step": "query_construction",
+          "description": "A retrieval query is built from intent + decision context, not just the raw user message"
+        },
+        {
+          "step": "source_routing",
+          "description": "Intent determines which knowledge source to query: product catalog or referral program rules"
+        },
+        {
+          "step": "retrieval",
+          "description": "The most semantically relevant content is retrieved from the selected source"
+        },
+        {
+          "step": "context_quality_evaluation",
+          "description": "context_recall_score and context_precision_score computed on RetrievedEvidence. If recall < threshold, query is refined and retrieval retried before injection."
+        },
+        {
+          "step": "evidence_injection",
+          "description": "Retrieved content with passing quality scores is passed to the response generation step as grounded context"
+        },
+        {
+          "step": "response_quality_evaluation",
+          "description": "groundedness_score and relevance_score computed on AssistantResponse. If either < threshold, response is blocked and a safe fallback message is returned."
+        }
+      ],
+      "knowledge_sources": [
+        {
+          "id": "product_catalog",
+          "queried_when": "intent is product_inquiry or decision context is ready",
+          "contains": "Product names, categories, attributes, brands"
+        },
+        {
+          "id": "referral_program_rules",
+          "queried_when": "intent is referral_question or fundraising opportunity detected",
+          "contains": "Referral mechanics, eligibility criteria, bonuses"
+        }
+      ],
+      "observable_behavior": "Given context kids=picky, preference=healthy, the retrieval query becomes 'healthy snacks suitable for picky children', not the raw user message. Product catalog is queried. Top results injected before generation. Response is grounded in retrieved evidence, not LLM memory.",
+      "rationale": "Using the accumulated decision context to construct the retrieval query significantly improves retrieval precision and response relevance. Better context input produces better retrieval, which produces better generation."
+    },
+    {
+      "id": "FR5",
+      "name": "Context-Driven Product Recommendation",
+      "category": "Core",
+      "statement": "The system must generate personalized product recommendations grounded exclusively in retrieved product evidence and the accumulated decision context, and connect each recommendation explicitly to the user's school fundraising goal.",
+      "observable_behavior": "Given context kids=picky, preference=healthy, school=Lincoln Elementary, an enriched retrieval query is constructed and products are retrieved (FR4). The assistant cites only retrieved products with reasoning tied to user preferences AND their school. Example: 'These healthy snacks are great for picky kids — and every purchase supports Lincoln Elementary.'",
+      "rationale": "Recommendations must be traceable to retrieved evidence. The fundraising connection must be explicit in every recommendation — this is the co-pilot's core business purpose, not a detail."
+    },
+    {
+      "id": "FR6",
+      "name": "Referral Guidance",
+      "category": "Core",
+      "statement": "The system must provide contextual guidance about the referral program and its fundraising impact when referral intent is detected, grounded in retrieved referral rules.",
+      "observable_behavior": "User asks how to help their school more. Referral intent detected. Referral program rules retrieved from knowledge base (FR4). Assistant explains mechanics and next action using retrieved content, not generic LLM knowledge.",
+      "rationale": "Referral rules are specific to the platform. Grounding this response in retrieved rules prevents incorrect guidance and builds user trust."
+    },
+    {
+      "id": "FR7",
+      "name": "Clarifying Question Generation",
+      "category": "Support",
+      "statement": "The system must detect when the decision context is insufficient to generate a good recommendation and respond with one focused clarifying question.",
+      "observable_behavior": "When preference signals are incomplete, the assistant asks one targeted question rather than guessing or presenting a questionnaire.",
+      "rationale": "Asking targeted questions fills context gaps efficiently without overwhelming the user."
+    },
+    {
+      "id": "FR8",
+      "name": "Conversational API Endpoint",
+      "category": "System",
+      "statement": "The system must expose the multi-turn conversation through a clean API endpoint that accepts a user message and session identifier, and returns the assistant response with the updated context state.",
+      "observable_behavior": "POST /chat with session_id and message returns assistant response and a context snapshot.",
+      "rationale": "The API is the integration surface for the mobile application. It must be stateful and conversation-aware."
+    }
+  ]
+}
