@@ -18,180 +18,264 @@ USER_IDS = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]
 # ── CSS ──────────────────────────────────────────────────────────────────────
 
 CSS = """
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+
 /* ── Base ── */
 .gradio-container {
-    background: #f4f6f9 !important;
+    background: #ECEEF1 !important;
     font-family: 'Inter', 'Segoe UI', system-ui, sans-serif !important;
+    min-height: 100vh;
 }
 
-/* ── Card wrapper ── */
+footer { display: none !important; }
+
+/* ── Chat panel card ── */
 #chat-col {
-    background: #ffffff;
-    border-radius: 14px;
-    border: 1px solid #e8ecf0;
-    box-shadow: 0 4px 24px rgba(0, 0, 0, 0.06);
-    padding: 28px !important;
+    background: #FFFFFF;
+    border-radius: 20px;
+    border: 1px solid rgba(0,0,0,0.06);
+    box-shadow: 0 2px 8px rgba(0,0,0,0.04), 0 16px 48px rgba(0,0,0,0.08);
+    padding: 36px !important;
 }
 
 /* ── Header ── */
 #app-header {
-    border-bottom: 1px solid #f0f3f6;
-    padding-bottom: 18px;
-    margin-bottom: 22px;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    border-bottom: 1px solid #F1F3F6;
+    padding-bottom: 20px;
+    margin-bottom: 24px;
 }
-#app-header h2 {
-    font-size: 1.15rem;
+#app-header-icon {
+    width: 40px;
+    height: 40px;
+    background: #0A2540;
+    border-radius: 10px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+}
+#app-header-text h2 {
+    font-size: 1.05rem;
     font-weight: 700;
-    color: #0d1117;
-    letter-spacing: -0.03em;
-    margin: 0 0 3px 0;
+    color: #0A2540;
+    letter-spacing: -0.02em;
+    margin: 0 0 2px 0;
+    line-height: 1.2;
 }
-#app-header p {
-    font-size: 0.75rem;
-    color: #8b98a8;
+#app-header-text p {
+    font-size: 0.70rem;
+    color: #94A3B8;
     margin: 0;
-    letter-spacing: 0.04em;
+    letter-spacing: 0.06em;
     text-transform: uppercase;
+    font-weight: 500;
 }
 
 /* ── Status badge ── */
 #status-md p {
-    font-size: 0.78rem;
-    color: #64748b;
-    margin: 0 0 14px 0;
-    padding: 7px 12px;
-    background: #f8fafc;
-    border-radius: 6px;
-    border-left: 3px solid #cbd5e1;
+    font-size: 0.76rem;
+    color: #475569;
+    margin: 0 0 16px 0;
+    padding: 9px 14px;
+    background: #F8FAFC;
+    border-radius: 8px;
+    border: 1px solid #E8EDF2;
     line-height: 1.5;
+    font-weight: 400;
 }
 
 /* ── Chatbot ── */
 #chatbot {
-    border: 1px solid #edf0f4 !important;
-    border-radius: 10px !important;
-    background: #fafbfc !important;
+    border: 1px solid #EDF0F4 !important;
+    border-radius: 14px !important;
+    background: #FAFBFC !important;
+}
+/* User bubbles — dark navy with white text */
+#chatbot .message.user,
+#chatbot [data-testid="user"],
+#chatbot .user > .message-bubble-border,
+#chatbot .bubble-wrap.user .message {
+    background: #0A2540 !important;
+    border-radius: 14px 14px 4px 14px !important;
+}
+#chatbot .message.user *,
+#chatbot [data-testid="user"] *,
+#chatbot .bubble-wrap.user .message * {
+    color: #FFFFFF !important;
+}
+/* Bot bubbles — light slate with dark text */
+#chatbot .message.bot,
+#chatbot .message.assistant,
+#chatbot [data-testid="bot"],
+#chatbot .bubble-wrap.bot .message {
+    background: #F1F5F9 !important;
+    border-radius: 14px 14px 14px 4px !important;
+}
+#chatbot .message.bot *,
+#chatbot .message.assistant *,
+#chatbot [data-testid="bot"] *,
+#chatbot .bubble-wrap.bot .message * {
+    color: #1E293B !important;
 }
 
 /* ── Input ── */
 #msg-input textarea {
-    border-radius: 8px !important;
-    border-color: #e2e8f0 !important;
-    font-size: 0.9rem !important;
+    border-radius: 10px !important;
+    border: 1px solid #E2E8F0 !important;
+    background: #FAFBFC !important;
+    font-size: 0.88rem !important;
+    color: #1E293B !important;
     resize: none !important;
+    padding: 12px 14px !important;
+    transition: border-color 0.2s, box-shadow 0.2s !important;
 }
 #msg-input textarea:focus {
-    border-color: #94a3b8 !important;
-    box-shadow: 0 0 0 3px rgba(148, 163, 184, 0.15) !important;
+    border-color: #0A2540 !important;
+    box-shadow: 0 0 0 3px rgba(10, 37, 64, 0.08) !important;
+    background: #FFFFFF !important;
+}
+#msg-input textarea::placeholder {
+    color: #B0BAC8 !important;
 }
 
 /* ── Buttons ── */
 #init-btn, #send-btn {
-    background: #0d1117 !important;
-    color: #ffffff !important;
+    background: #0A2540 !important;
+    color: #FFFFFF !important;
     border: none !important;
-    border-radius: 8px !important;
-    font-weight: 500 !important;
+    border-radius: 10px !important;
+    font-weight: 600 !important;
+    font-size: 0.85rem !important;
+    letter-spacing: 0.01em !important;
+    transition: background 0.2s, transform 0.1s, box-shadow 0.2s !important;
+    box-shadow: 0 1px 3px rgba(10,37,64,0.18) !important;
 }
 #init-btn:hover, #send-btn:hover {
-    background: #1e2a3a !important;
+    background: #0F3460 !important;
+    box-shadow: 0 4px 12px rgba(10,37,64,0.22) !important;
+    transform: translateY(-1px) !important;
+}
+#init-btn:active, #send-btn:active {
+    transform: translateY(0) !important;
 }
 #clear-btn {
-    background: #ffffff !important;
+    background: #FFFFFF !important;
     color: #475569 !important;
-    border: 1px solid #dde3ec !important;
-    border-radius: 8px !important;
+    border: 1px solid #DDE3EC !important;
+    border-radius: 10px !important;
+    font-weight: 500 !important;
+    font-size: 0.85rem !important;
+    transition: background 0.2s, border-color 0.2s !important;
 }
 #clear-btn:hover {
-    background: #f8fafc !important;
+    background: #F8FAFC !important;
+    border-color: #94A3B8 !important;
 }
 #close-btn {
-    background: #ffffff !important;
-    color: #dc2626 !important;
-    border: 1px solid #fca5a5 !important;
+    background: transparent !important;
+    color: #94A3B8 !important;
+    border: 1px solid #E8EDF2 !important;
     border-radius: 8px !important;
-    font-size: 0.8rem !important;
+    font-size: 0.76rem !important;
+    font-weight: 500 !important;
+    letter-spacing: 0.02em !important;
+    transition: color 0.2s, border-color 0.2s, background 0.2s !important;
 }
 #close-btn:hover {
-    background: #fef2f2 !important;
-    border-color: #f87171 !important;
+    color: #DC2626 !important;
+    border-color: #FECACA !important;
+    background: #FEF2F2 !important;
 }
 button:disabled {
-    opacity: 0.38 !important;
+    opacity: 0.35 !important;
     cursor: not-allowed !important;
+    transform: none !important;
+    box-shadow: none !important;
 }
 
 /* ── Dropdown ── */
 #user-dropdown label {
-    font-size: 0.8rem !important;
-    font-weight: 500 !important;
-    color: #64748b !important;
+    font-size: 0.76rem !important;
+    font-weight: 600 !important;
+    color: #64748B !important;
+    letter-spacing: 0.03em !important;
+    text-transform: uppercase !important;
+}
+#user-dropdown select, #user-dropdown input {
+    border-radius: 10px !important;
+    border: 1px solid #E2E8F0 !important;
+    font-size: 0.88rem !important;
 }
 
 /* ── RAG eval panel ── */
 #rag-col {
-    background: #ffffff;
-    border-radius: 14px;
-    border: 1px solid #e8ecf0;
-    box-shadow: 0 4px 24px rgba(0, 0, 0, 0.06);
-    padding: 24px !important;
+    background: #0A2540;
+    border-radius: 20px;
+    border: none;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.10), 0 16px 48px rgba(0,0,0,0.14);
+    padding: 28px !important;
     align-self: flex-start;
 }
 #rag-title {
-    font-size: 0.72rem;
+    font-size: 0.65rem;
     font-weight: 700;
-    letter-spacing: 0.08em;
+    letter-spacing: 0.12em;
     text-transform: uppercase;
-    color: #94a3b8;
-    margin: 0 0 16px 0;
-    padding-bottom: 10px;
-    border-bottom: 1px solid #f0f3f6;
+    color: rgba(255,255,255,0.35);
+    margin: 0 0 20px 0;
+    padding-bottom: 12px;
+    border-bottom: 1px solid rgba(255,255,255,0.08);
 }
 .rag-metric {
-    margin-bottom: 14px;
+    margin-bottom: 18px;
 }
 .rag-metric-header {
     display: flex;
     justify-content: space-between;
     align-items: baseline;
-    margin-bottom: 3px;
+    margin-bottom: 6px;
 }
 .rag-metric-name {
-    font-size: 0.78rem;
+    font-size: 0.76rem;
     font-weight: 600;
-    color: #334155;
+    color: rgba(255,255,255,0.80);
+    letter-spacing: 0.01em;
 }
 .rag-metric-score {
-    font-size: 0.85rem;
+    font-size: 0.88rem;
     font-weight: 700;
-    color: #0d1117;
+    color: #FFFFFF;
     font-variant-numeric: tabular-nums;
 }
 .rag-metric-desc {
     font-size: 0.68rem;
-    color: #94a3b8;
-    line-height: 1.45;
+    color: rgba(255,255,255,0.65);
+    line-height: 1.5;
     margin: 0;
 }
 .rag-bar-track {
-    height: 4px;
-    background: #f1f5f9;
+    height: 3px;
+    background: rgba(255,255,255,0.10);
     border-radius: 2px;
-    margin-top: 5px;
+    margin-top: 6px;
     overflow: hidden;
 }
 .rag-bar-fill {
     height: 100%;
     border-radius: 2px;
-    background: linear-gradient(90deg, #94a3b8, #0d1117);
-    transition: width 0.4s ease;
+    background: linear-gradient(90deg, #38BDF8, #FFFFFF);
+    transition: width 0.5s cubic-bezier(0.4, 0, 0.2, 1);
 }
 .rag-empty {
-    font-size: 0.75rem;
-    color: #cbd5e1;
+    font-size: 0.74rem;
+    color: rgba(255,255,255,0.22);
     text-align: center;
-    padding: 32px 0;
-    line-height: 1.6;
+    padding: 40px 0;
+    line-height: 1.8;
+    letter-spacing: 0.01em;
 }
 """
 
@@ -316,14 +400,14 @@ def _build_rag_html(data: dict) -> str:
             f'</div>'
         )
     return (
-        f'<p id="rag-title">RAG eval</p>'
+        f'<p id="rag-title">Intelligence Metrics</p>'
         f'{rows}'
     )
 
 
 _RAG_EMPTY_HTML = (
-    '<p id="rag-title">RAG eval</p>'
-    '<div class="rag-empty">Send a message<br>to see metrics.</div>'
+    '<p id="rag-title">Intelligence Metrics</p>'
+    '<div class="rag-empty">Send a message<br>to surface metrics.</div>'
 )
 
 
@@ -396,7 +480,7 @@ def close_session(session_id, user_id):
 
 # ── Layout ────────────────────────────────────────────────────────────────────
 
-with gr.Blocks(css=CSS, title="Carton Caps Assistant") as demo:
+with gr.Blocks(css=CSS, title="Carton Caps Assistant", theme=gr.themes.Base(font=gr.themes.GoogleFont("Inter"))) as demo:
 
     session_id_state = gr.State("")
     user_id_state = gr.State("")
@@ -411,9 +495,18 @@ with gr.Blocks(css=CSS, title="Carton Caps Assistant") as demo:
 
             gr.HTML(
                 '<div id="app-header">'
-                "<h2>Carton Caps Assistant</h2>"
-                "<p>Conversational AI &nbsp;·&nbsp; Showcase</p>"
-                "</div>"
+                '<div id="app-header-icon">'
+                '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">'
+                '<path d="M12 2L2 7L12 12L22 7L12 2Z" stroke="white" stroke-width="1.8" stroke-linejoin="round"/>'
+                '<path d="M2 17L12 22L22 17" stroke="white" stroke-width="1.8" stroke-linejoin="round"/>'
+                '<path d="M2 12L12 17L22 12" stroke="white" stroke-width="1.8" stroke-linejoin="round"/>'
+                '</svg>'
+                '</div>'
+                '<div id="app-header-text">'
+                '<h2>Carton Caps Assistant</h2>'
+                '<p>Conversational AI &nbsp;&middot;&nbsp; Executive Preview</p>'
+                '</div>'
+                '</div>'
             )
 
             # Session controls
@@ -530,4 +623,4 @@ with gr.Blocks(css=CSS, title="Carton Caps Assistant") as demo:
 
 
 if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=7860)
+    demo.launch(server_name="0.0.0.0", server_port=8500)

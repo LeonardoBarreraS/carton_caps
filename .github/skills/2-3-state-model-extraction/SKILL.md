@@ -1,20 +1,23 @@
 ---
 name: 2-3-state-model-extraction
-description: Defines the explicit state model of process entities, including state space and transition structure. Establishes the formal lifecycle representation required for invariant detection and aggregate design.
+description: Defines explicit state models for process entities and identifies state and transitions in all relevant domain entities, establishing a complete and unambiguous representation of system evolution.
 ---
 
-# State Model Extraction
+# 2.3 — State Model Extraction
 
 ## Purpose
-This skill transforms **process entities** into **explicit state models**.
+Transform **process entities** into **explicit state models**, and extend state reasoning to **all domain entities that evolve over time**.
 
 It defines:
-- the complete state space
-- valid transitions between states
-- invalid transitions
-- lifecycle structure (initial → terminal)
+- complete state space  
+- valid transitions  
+- invalid transitions  
+- lifecycle boundaries  
+- state-dependent constraints  
 
-This is a **critical semantic step** that makes system evolution **explicit and unambiguous**.
+This ensures that:
+
+System evolution is **explicit, controlled, and semantically consistent**.
 
 ---
 
@@ -23,159 +26,203 @@ This is a **critical semantic step** that makes system evolution **explicit and 
 Process entities define that something evolves  
 State models define how it evolves  
 
-A correct domain requires:
-- explicit state space
-- controlled transitions
-- finite lifecycle
+All entities may have state  
+Process entities make it explicit  
+
+---
+
+## Critical Insight
+
+State modeling exists at two levels:
+
+### Level 1 — Explicit State Machines (Primary)
+Applied to:
+- process entities  
+
+Defines:
+- full lifecycle  
+- finite states  
+- explicit transitions  
+
+---
+
+### Level 2 — Implicit State Structures (Secondary)
+Applied to:
+- entities and aggregates  
+
+Defines:
+- state attributes  
+- allowed transitions  
+- invariant-driven constraints  
+
+These may not be full state machines, but they still:
+- evolve over time  
+- must remain valid  
 
 ---
 
 ## When to Use
 
 Use this skill when:
-- process entities are identified
-- workflows are defined
-- before invariant detection
-- before aggregate design
+- process entities are identified  
+- domain concepts are defined  
+- workflows are modeled  
+- before invariant detection  
+- before aggregate design  
 
 ---
 
 ## Strict Rules
 
 ### DO NOT:
-- define methods or implementation
-- define domain services
-- define architecture
-- define infrastructure
-- define orchestration logic
+- define methods or implementation  
+- define aggregates or architecture  
+- define domain services  
+- introduce infrastructure or orchestration  
 
 ### ONLY DEFINE:
-- states
-- state space
-- transitions
-- lifecycle structure
+- states  
+- state space  
+- transitions  
+- lifecycle structure  
+- state constraints  
 
 ---
 
 ## What is a State Model
 
-A state model is a **formal representation of lifecycle**:
+A state model is a formal representation of:
+- possible states  
+- allowed transitions  
+- forbidden transitions  
+- lifecycle boundaries  
 
-It defines:
-- all possible states
-- all allowed transitions
-- all forbidden transitions
-- lifecycle boundaries
-
-This is equivalent to a **finite state machine (conceptually)**.
+Conceptually:
+- finite state machine (for process entities)  
+- constrained state space (for entities)  
 
 ---
 
 ## Execution Methodology
 
-Follow this reasoning pipeline:
-
 ---
 
-### Step 1 — Select Process Entity
+## PART A — Process Entity State Modeling (PRIMARY)
 
-Select one process entity at a time.
+### Step 1 — Select Process Entity
+Select one process entity.
 
 Example:
-Execution
+Execution  
 
 ---
 
 ### Step 2 — Define State Space
-
 List all possible states.
 
-#### Rules:
-- states must be finite
-- states must be mutually exclusive
-- states must represent conditions (not actions)
+Rules:
+- finite  
+- mutually exclusive  
+- represent conditions (not actions)  
 
-#### Example:
-- created
-- running
-- evaluating
-- completed
-- failed
+Example:
+- created  
+- running  
+- evaluating  
+- completed  
+- failed  
 
 ---
 
 ### Step 3 — Normalize States
-
 Ensure:
-- no duplicated meaning
-- consistent naming
-- no technical terminology
-
-#### Bad:
-- processing_data
-- api_called
-
-#### Good:
-- processing
-- executing
+- no duplicated meaning  
+- consistent naming  
+- no technical terminology  
 
 ---
 
 ### Step 4 — Define Valid Transitions
+Format:
+State A → State B  
 
-Define allowed transitions.
-
-#### Format:
-State A → State B
-
-#### Example:
-created → running  
-running → evaluating  
-evaluating → completed  
-running → failed  
-
-#### Rules:
-- transitions must represent valid progression
-- avoid implicit transitions
-- avoid skipping unless explicitly required
+Rules:
+- represent valid progression  
+- avoid implicit transitions  
+- avoid skipping unless required  
 
 ---
 
 ### Step 5 — Define Invalid Transitions
+Explicitly list forbidden transitions.
 
-Explicitly define forbidden transitions.
-
-#### Example:
-completed → running  
-failed → evaluating  
-created → completed  
-
-These will later become invariants.
+These will later become invariants.  
 
 ---
 
-### Step 6 — Identify Initial and Terminal States
-
-#### Initial State:
-- where lifecycle starts
-
-#### Terminal States:
-- where lifecycle ends (no further transitions)
-
-#### Example:
-Initial: created  
-Terminal: completed, failed  
+### Step 6 — Identify Lifecycle Boundaries
+Define:
+- initial state  
+- terminal states  
 
 ---
 
-### Step 7 — Validate State Model
-
+### Step 7 — Validate State Machine
 Ensure:
-- all states are reachable
-- transitions are coherent
-- no contradictory transitions exist
-- lifecycle has clear start and end
-- no ambiguous or redundant states
+- all states are reachable  
+- transitions are coherent  
+- lifecycle is finite  
+- no ambiguity exists  
+
+---
+
+## PART B — Entity State Identification (SECONDARY)
+
+### Step 8 — Identify Stateful Entities
+From domain concepts:
+
+Detect entities that:
+- change over time  
+- have state-dependent behavior  
+
+---
+
+### Step 9 — Identify State Attributes
+For each entity:
+
+Define:
+- attributes that represent state  
+
+Examples:
+- status  
+- phase  
+- condition flags  
+
+---
+
+### Step 10 — Identify Implicit Transitions
+Define how state changes occur.
+
+Examples:
+- draft → confirmed  
+- active → inactive  
+
+---
+
+### Step 11 — Identify State Constraints
+Define conditions that must hold in specific states.
+
+Examples:
+- completed → result must exist  
+- cancelled → no further changes allowed  
+
+---
+
+### Step 12 — Validate Entity State Consistency
+Ensure:
+- no invalid state combinations  
+- transitions align with domain rules  
+- constraints are enforceable  
 
 ---
 
@@ -190,48 +237,66 @@ Ensure:
 ### States
 - ...
 - ...
-- ...
 
 ### Initial State
 - ...
 
 ### Terminal States
 - ...
-- ...
 
 ### Valid Transitions
 - State A → State B
-- State B → State C
 
 ### Invalid Transitions
 - State X → State Y
+
+---
+
+## Entity State Definitions
+
+### Entity: <Name>
+
+#### State Attributes
+- ...
+
+#### Possible States
+- ...
+
+#### Allowed Transitions
+- ...
+
+#### State Constraints
 - ...
 
 ---
 
 ## State Model Description
-- describes lifecycle
-- explains progression logic
-- clarifies meaning of transitions
+- describes lifecycle logic  
+- explains transitions  
+- clarifies constraints  
 
 ---
 
 ### JSON
 
 {
-  "state_models": [
+  "process_state_models": [
     {
       "process_entity": "",
       "states": [],
       "initial_state": "",
       "terminal_states": [],
-      "valid_transitions": [
-        ["stateA", "stateB"]
-      ],
-      "invalid_transitions": [
-        ["stateX", "stateY"]
-      ],
-      "description": ""
+      "valid_transitions": [],
+      "invalid_transitions": []
+    }
+  ],
+  "entity_states": [
+    {
+      "entity": "",
+      "state_attributes": [],
+      "states": [],
+      "transitions": [],
+      "constraints": []
     }
   ]
 }
@@ -241,32 +306,30 @@ Ensure:
 ## Completion Criteria
 
 The skill is complete when:
-- all states are explicitly defined
-- initial state is defined
-- terminal states are defined
-- valid transitions are defined
-- invalid transitions are explicitly listed
-- lifecycle is coherent and finite
-- no implementation details are introduced
-- JSON output is valid and structured
+- all process entities have explicit state machines  
+- all relevant entities have defined state structures  
+- transitions are explicitly defined or constrained  
+- lifecycle boundaries are clear  
+- invalid transitions are identified  
+- no ambiguity exists in system evolution  
+- JSON output is valid and structured  
 
 ---
 
 ## Key Insight
 
+State is universal  
+Process entities make it explicit  
+Aggregates enforce it  
+Invariants protect it  
+
 This skill transforms:
 
-Process entity → Formal state machine
+System evolution → Formal, controlled state structure  
 
-It eliminates ambiguity by making:
-- state explicit
-- transitions controlled
-- lifecycle finite
+Without this:
+- transitions remain implicit  
+- invariants become unclear  
+- domain becomes inconsistent  
 
-This is essential for:
-- invariant detection
-- aggregate design
-- domain correctness
-
-Without a state model, domain logic becomes inconsistent and unreliable.
-
+State modeling is the foundation of domain correctness.

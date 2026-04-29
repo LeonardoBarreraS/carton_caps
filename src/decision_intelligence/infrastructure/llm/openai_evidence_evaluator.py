@@ -41,7 +41,7 @@ class OpenAIEvidenceEvaluator(IEvidenceEvaluator):
     These scores drive the retrieval retry cycle in DecisionIntelligenceSubgraph.
     """
 
-    def __init__(self, openai_client: OpenAI, model: str = "gpt-4o-mini") -> None:
+    def __init__(self, openai_client: OpenAI, model: str = "gpt-5.4-mini") -> None:
         self._client = openai_client
         self._model = model
 

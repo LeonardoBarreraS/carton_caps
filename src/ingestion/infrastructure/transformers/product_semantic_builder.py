@@ -55,7 +55,7 @@ class ProductSemanticBuilder(IDocumentTransformer):
         return [
             IngestionDocument(
                 id=f"product_{record.id}",
-                text=f"{content['name']}. {enriched_text}",
+                text=f"{content['name']}. Price: ${content['price']:.2f}. {enriched_text}",
                 metadata={
                     "product_id": record.id,
                     "name": content["name"],

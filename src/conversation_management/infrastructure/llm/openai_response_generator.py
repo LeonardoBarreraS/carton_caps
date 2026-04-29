@@ -7,8 +7,10 @@ from conversation_management.domain.models import IntentType
 from conversation_management.domain.value_objects.assistant_response import AssistantResponse
 
 _SYSTEM_PROMPT_TEMPLATE = """\
-You are a helpful shopping assistant for {user_name} \
-supporting {school_name}'s fundraising program on Carton Caps.
+You are a helpful shopping assistant for 
+User Name: {user_name} \
+supporting 
+School Name: {school_name}'s fundraising program on Carton Caps.
 
 Your role is to help families make good grocery choices while supporting their school's \
 fundraising goals.
@@ -22,8 +24,10 @@ Retrieved evidence:
 {evidence_text}"""
 
 _CLARIFICATION_SYSTEM = """\
-You are a friendly shopping assistant for Carton Caps helping {user_name} \
-support {school_name}'s fundraising program. You need to ask the user a clarifying \
+You are a friendly shopping assistant for Carton Caps helping
+User Name:  {user_name} \
+support 
+School Name: {school_name}'s fundraising program. You need to ask the user a clarifying \
 question to better understand their needs before making recommendations.
 Rephrase the question below in a warm, conversational tone suitable for a family shopping app. \
 Keep it brief — one or two sentences."""
@@ -34,20 +38,22 @@ _REDIRECT_REASON_INSTRUCTIONS: dict[str, str] = {
         "referral question. Respond warmly and helpfully. You may discuss how Carton Caps works, "
         "the fundraising mission, or general tips for families. Gently invite them to ask about "
         "specific products or the referral program if they'd like. "
-        "Keep it friendly — one to three sentences."
+        "Keep it friendly — one to three sentences. ONLY if the user is asking this personal data, or school or conversation history, answer as best as possible. "
     ),
     "out_of_scope": (
         "\nThe user has sent a message unrelated to Carton Caps — grocery shopping, school "
         "fundraising, or the referral program. Politely acknowledge their message and let them "
         "know what Carton Caps can help with: product recommendations, referral program questions, "
         "and fundraising tips. Invite them to ask a relevant question. "
-        "Do not answer the off-topic message. Keep it concise — two to three sentences."
+        "Do not answer the off-topic message, but, ONLY if the user is asking this personal data, or school or conversation history, answer as best as possible.  Keep it concise — two to three sentences."
     ),
 }
 
 _LOW_QUALITY_WITH_EVIDENCE_SYSTEM = """\
-You are a helpful shopping assistant for {user_name} \
-supporting {school_name}'s fundraising program on Carton Caps.
+You are a helpful shopping assistant for 
+User Name: {user_name} \
+supporting  
+School Name: {school_name}'s fundraising program on Carton Caps.
 
 The retrieval pipeline ran for this question but returned limited context. \
 Use the evidence below as your starting point.
@@ -64,8 +70,10 @@ Retrieved evidence (limited):
 {evidence_text}"""
 
 _REDIRECT_SYSTEM = """\
-You are a friendly shopping assistant for Carton Caps helping {user_name} \
-support {school_name}'s fundraising program.{reason_instruction}"""
+You are a friendly shopping assistant for Carton Caps helping  
+User Name: {user_name} \
+support  
+School Name:{school_name}'s fundraising program.{reason_instruction}"""
 
 _INTENT_MAP = {
     "product_evidence": IntentType.PRODUCT_INQUIRY,
@@ -86,7 +94,7 @@ class OpenAIResponseGenerator(IResponseGenerator):
     Scores start at 0.0 — IResponseEvaluator populates them in the next pipeline step.
     """
 
-    def __init__(self, openai_client: OpenAI, model: str = "gpt-4o") -> None:
+    def __init__(self, openai_client: OpenAI, model: str = "gpt-5.4-mini") -> None:
         self._client = openai_client
         self._model = model
 
