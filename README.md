@@ -106,7 +106,7 @@ See `.env.example` for the full list. The key ones:
 | `OPENAI_API_KEY` | Yes | OpenAI API key |
 | `QDRANT_URL` | Yes | Qdrant instance URL |
 | `QDRANT_API_KEY` | No | Only needed for Qdrant Cloud |
-| `LLM_MODEL` | No | Defaults to `gpt-4o-mini` |
+| `LLM_MODEL` | No | Defaults to `gpt-5.4-mini` |
 
 ---
 
